@@ -1,11 +1,11 @@
 """
 Backtesting engine for GME trading strategy.
-Updated for classification-based trading with Hurst regime filtering.
+Updated for classification-based trading with DFA/Hurst regime filtering.
 
 Trading Logic:
 1. Base ensemble predicts: Long (1), Short (-1), Flat (0)
 2. Meta-labeler vetos if confidence is low
-3. Hurst filter only allows trades in trending regimes (H > 0.55)
+3. Regime filter only allows trades in trending regimes (Alpha > 1.0)
 4. Final signal is executed only if all filters pass
 """
 
@@ -13,7 +13,6 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, Optional
 import config
-from regime import rolling_hurst, regime_filter
 
 
 class Backtester:
@@ -21,14 +20,14 @@ class Backtester:
     Backtesting engine for classification-based trading strategy.
     
     Filters:
-    1. Hurst Regime Filter: Only trade when H > trending_threshold
+    1. Regime Filter: Only trade when Alpha > trending_threshold
     2. Meta-Labeler Filter: Only trade when meta-confidence > threshold
     3. Direction: Follow base ensemble's Long/Short/Flat signal
     """
     
     def __init__(
         self,
-        hurst_threshold: float = config.HURST_TRENDING_THRESHOLD,
+        hurst_threshold: float = 1.0, # Now represents DFA Alpha threshold
         meta_threshold: float = 0.5,
         transaction_cost: float = 0.0005  # 5 bps per trade
     ):
@@ -36,7 +35,7 @@ class Backtester:
         Initialize backtester.
         
         Args:
-            hurst_threshold: Minimum H to allow trading
+            hurst_threshold: Minimum Regime value (DFA Alpha) to allow trading
             meta_threshold: Minimum meta-labeler probability to act
             transaction_cost: Cost per trade as fraction of position
         """
@@ -62,9 +61,9 @@ class Backtester:
         
         Args:
             predictions: Base ensemble predictions (1, -1, 0)
-            hurst: Hurst exponent values for each time point
+            hurst: Regime indicator values (DFA Alpha)
             meta_proba: Meta-labeler probabilities (optional)
-            apply_hurst_filter: Whether to apply Hurst regime filter
+            apply_hurst_filter: Whether to apply regime filter
             apply_meta_filter: Whether to apply meta-labeler filter
             
         Returns:
@@ -72,7 +71,7 @@ class Backtester:
         """
         signals = predictions.copy().astype(float)
         
-        # Apply Hurst regime filter
+        # Apply Regime filter
         if apply_hurst_filter:
             # Only trade in trending regimes
             non_trending = hurst < self.hurst_threshold
@@ -216,7 +215,7 @@ class Backtester:
         Args:
             predictions: Base ensemble predictions (1, -1, 0)
             actual_returns: Actual returns that occurred
-            hurst: Hurst exponent values
+            hurst: Hurst/DFA values
             meta_proba: Optional meta-labeler probabilities
             timestamps: Optional datetime index for results
             
@@ -241,9 +240,10 @@ class Backtester:
             results['meta_proba'] = meta_proba
         
         # Add regime classification
+        # Using 1.0 threshold for DFA
         results['regime'] = np.where(
-            hurst > config.HURST_TRENDING_THRESHOLD, 'trending',
-            np.where(hurst < config.HURST_MEAN_REVERT_THRESHOLD, 'mean_revert', 'random')
+            hurst > self.hurst_threshold, 'trending',
+            np.where(hurst < 1.0, 'mean_revert', 'random')
         )
         
         # Set index if timestamps provided
@@ -296,46 +296,5 @@ class Backtester:
         print(f"  Trades Filtered:  {metrics.get('trades_filtered', 0):>10.0f}")
         
         print("\n🔄 Regime Statistics:")
-        print(f"  Trending:         {metrics.get('pct_trending', 0):>10.1%}")
+        print(f"  Trending (Alpha>{self.hurst_threshold}): {metrics.get('pct_trending', 0):>10.1%}")
         print(f"  Mean-Reverting:   {metrics.get('pct_mean_revert', 0):>10.1%}")
-        print(f"  Random Walk:      {metrics.get('pct_random', 0):>10.1%}")
-
-
-if __name__ == "__main__":
-    # Test backtester with classification signals
-    np.random.seed(42)
-    
-    n_samples = 500
-    
-    # Simulate predictions and actual returns
-    # Create some correlation between predictions and returns for realistic test
-    true_trend = np.sin(np.linspace(0, 8 * np.pi, n_samples)) * 0.02
-    actual_returns = true_trend + np.random.randn(n_samples) * 0.01
-    
-    # Predictions with some accuracy
-    predictions = np.sign(true_trend + np.random.randn(n_samples) * 0.01)
-    predictions = predictions.astype(int)
-    
-    # Simulate Hurst exponent (varying between 0.3 and 0.7)
-    hurst = 0.5 + 0.15 * np.sin(np.linspace(0, 4 * np.pi, n_samples))
-    hurst += np.random.randn(n_samples) * 0.05
-    
-    # Simulate meta-labeler probabilities
-    meta_proba = 0.5 + 0.3 * np.random.rand(n_samples)
-    
-    print("Testing Classification Backtester")
-    print("=" * 50)
-    
-    backtester = Backtester(hurst_threshold=0.55, meta_threshold=0.5)
-    
-    results, metrics = backtester.run_backtest(
-        predictions=predictions,
-        actual_returns=actual_returns,
-        hurst=hurst,
-        meta_proba=meta_proba
-    )
-    
-    print(f"\nResults shape: {results.shape}")
-    print(f"Columns: {list(results.columns)}")
-    
-    backtester.print_metrics(metrics)

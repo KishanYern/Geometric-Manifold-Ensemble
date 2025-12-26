@@ -74,7 +74,11 @@ def load_ohlcv(
     if since:
         since_ts = int(since.timestamp() * 1000)
     
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since_ts, limit=limit)
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since_ts, limit=limit)
+    except Exception as e:
+        print(f"Error fetching OHLCV: {e}")
+        return pd.DataFrame()
     
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -109,18 +113,22 @@ def load_funding_rates(
     if since:
         since_ts = int(since.timestamp() * 1000)
     
-    # Fetch funding rate history
-    funding = exchange.fetch_funding_rate_history(symbol, since=since_ts, limit=limit)
-    
-    if not funding:
+    try:
+        # Fetch funding rate history
+        funding = exchange.fetch_funding_rate_history(symbol, since=since_ts, limit=limit)
+        
+        if not funding:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(funding)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df = df[['fundingRate']].rename(columns={'fundingRate': 'funding_rate'})
+        
+        return df
+    except Exception as e:
+        print(f"Warning: Could not fetch funding rates: {e}")
         return pd.DataFrame()
-    
-    df = pd.DataFrame(funding)
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    df = df[['fundingRate']].rename(columns={'fundingRate': 'funding_rate'})
-    
-    return df
 
 
 def load_open_interest(
@@ -239,6 +247,9 @@ def load_binance_data(
     print(f"Loading OHLCV for {symbol}...")
     df = load_ohlcv(symbol, timeframe, limit, since)
     
+    if df.empty:
+        raise ValueError("No OHLCV data returned from Binance")
+    
     # Compute CVD
     df['cvd'] = compute_cvd(df)
     df['cvd_normalized'] = (df['cvd'] - df['cvd'].mean()) / df['cvd'].std()
@@ -246,24 +257,54 @@ def load_binance_data(
     # Load Open Interest
     if include_oi:
         print("Loading Open Interest...")
-        oi_df = load_open_interest(symbol, timeframe, limit)
-        if not oi_df.empty:
-            df = df.join(oi_df, how='left')
-            # Normalize OI
-            if 'open_interest' in df.columns:
-                df['oi_normalized'] = (df['open_interest'] - df['open_interest'].mean()) / df['open_interest'].std()
+        try:
+            oi_df = load_open_interest(symbol, timeframe, limit)
+            if not oi_df.empty:
+                df = df.join(oi_df, how='left')
+                
+                if 'open_interest' in df.columns:
+                    # Check if empty or entirely nan
+                    if df['open_interest'].isna().all():
+                        print("Warning: Retrieved OI data is empty. Using Hybrid Mode fallback (No OI).")
+                        df.drop(columns=['open_interest', 'oi_value'], errors='ignore', inplace=True)
+                    else:
+                        # Forward fill small gaps
+                        df['open_interest'] = df['open_interest'].ffill()
+                        
+                        # Fill initial NaNs with mean
+                        oi_mean = df['open_interest'].mean()
+                        df['open_interest'] = df['open_interest'].fillna(oi_mean)
+                        
+                        df['oi_normalized'] = (df['open_interest'] - df['open_interest'].mean()) / df['open_interest'].std()
+            else:
+                 print("Warning: No Open Interest data returned. Using Hybrid Mode fallback.")
+        except Exception as e:
+            print(f"Error loading Open Interest: {e}. Using Hybrid Mode fallback.")
     
     # Load Funding Rates
     if include_funding:
         print("Loading Funding Rates...")
-        funding_df = load_funding_rates(symbol, limit)
-        if not funding_df.empty:
-            # Resample funding to match OHLCV timeframe (funding is every 8h)
-            funding_resampled = funding_df.resample(timeframe).last()
-            df = df.join(funding_resampled, how='left')
-            df['funding_rate'] = df['funding_rate'].ffill()
+        try:
+            funding_df = load_funding_rates(symbol, limit)
+            if not funding_df.empty:
+                # Resample funding to match OHLCV timeframe (funding is every 8h)
+                funding_resampled = funding_df.resample(timeframe).last()
+                df = df.join(funding_resampled, how='left')
+                
+                if 'funding_rate' in df.columns:
+                    if df['funding_rate'].isna().all():
+                        print("Warning: Retrieved Funding data is empty. Using Hybrid Mode fallback.")
+                        df.drop(columns=['funding_rate'], errors='ignore', inplace=True)
+                    else:
+                        df['funding_rate'] = df['funding_rate'].ffill()
+                        # Fill initial NaNs with 0
+                        df['funding_rate'] = df['funding_rate'].fillna(0.0)
+            else:
+                print("Warning: No Funding Rate data returned. Using Hybrid Mode fallback.")
+        except Exception as e:
+             print(f"Error loading Funding Rates: {e}. Using Hybrid Mode fallback.")
     
-    # Forward fill any missing values
+    # Forward fill any remaining missing values in OHLCV
     df = df.ffill()
     
     return df
@@ -288,18 +329,13 @@ if __name__ == "__main__":
             
             print(f"\nLoaded {len(df)} records")
             print(f"Columns: {list(df.columns)}")
+            
+            if 'open_interest' not in df.columns:
+                 print("Result: Hybrid Mode Active (OI missing)")
+            else:
+                 print("Result: Full Dimensionality (OI present)")
+            
             print(f"Date range: {df.index[0]} to {df.index[-1]}")
             
-            print("\nSample data:")
-            print(df[['close', 'volume', 'cvd_normalized']].tail())
-            
-            if 'open_interest' in df.columns:
-                print(f"\nOpen Interest available: {df['open_interest'].notna().sum()} values")
-            
-            if 'funding_rate' in df.columns:
-                print(f"Funding Rate available: {df['funding_rate'].notna().sum()} values")
-                print(f"Funding Rate range: {df['funding_rate'].min():.6f} to {df['funding_rate'].max():.6f}")
-                
         except Exception as e:
             print(f"Error loading data: {e}")
-            print("This may be due to rate limiting or network issues.")

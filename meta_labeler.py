@@ -12,8 +12,7 @@ are trustworthy based on market conditions (H, Vol, signature features).
 
 import numpy as np
 import pandas as pd
-from typing import Optional, Tuple
-from sklearn.model_selection import TimeSeriesSplit
+from typing import Optional, Tuple, List
 import config
 
 try:
@@ -64,7 +63,6 @@ class MetaLabeler:
             'learning_rate': learning_rate,
             'objective': 'binary:logistic',
             'eval_metric': 'auc',
-            'use_label_encoder': False,
             'random_state': random_state,
             'n_jobs': -1
         }
@@ -81,17 +79,22 @@ class MetaLabeler:
         X: np.ndarray,
         y: np.ndarray,
         feature_names: Optional[list] = None,
-        auto_balance: bool = True
+        auto_balance: bool = True,
+        early_stopping_rounds: Optional[int] = 10,
+        eval_set: Optional[list] = None,
+        validation_split: Optional[float] = 0.1
     ) -> 'MetaLabeler':
         """
-        Fit the meta-labeler on historical trades.
+        Fit the meta-labeler on historical trades with early stopping.
         
         Args:
             X: Feature matrix (n_samples, n_features)
-               Features should include: [H, volatility, signature_features...]
             y: Binary labels (1 = trade correct, 0 = trade wrong)
             feature_names: Optional list of feature names for importance
             auto_balance: Whether to auto-compute class weight for imbalance
+            early_stopping_rounds: Rounds without improvement to stop
+            eval_set: Explicit validation set [(X_val, y_val)]
+            validation_split: If eval_set is None, fraction of X to use for validation (time-series split)
             
         Returns:
             self
@@ -104,7 +107,28 @@ class MetaLabeler:
                 scale = n_neg / n_pos
                 self.model.set_params(scale_pos_weight=scale)
         
-        self.model.fit(X, y)
+        # Prepare evaluation set for early stopping
+        if early_stopping_rounds is not None:
+            if eval_set is None and validation_split is not None:
+                # Create time-series split for validation
+                # Always split strictly chronologically
+                split_idx = int(len(X) * (1 - validation_split))
+                X_train, X_val = X[:split_idx], X[split_idx:]
+                y_train, y_val = y[:split_idx], y[split_idx:]
+                eval_set = [(X_val, y_val)]
+                X_fit, y_fit = X_train, y_train
+            else:
+                X_fit, y_fit = X, y
+            
+            self.model.fit(
+                X_fit, y_fit,
+                eval_set=eval_set,
+                verbose=False,
+                early_stopping_rounds=early_stopping_rounds
+            )
+        else:
+            self.model.fit(X, y)
+            
         self.feature_names = feature_names
         self._is_fitted = True
         
@@ -167,7 +191,7 @@ def create_meta_features(
     Create feature matrix for meta-labeler.
     
     Args:
-        base_predictions: Base ensemble predictions (n_samples, n_classes)
+        base_predictions: Base ensemble predictions (n_samples, n_classes) or probabilities
         hurst: Hurst exponent values (n_samples,)
         volatility: Rolling volatility (n_samples,)
         signature_features: Optional signature features (n_samples, n_sig_features)
@@ -218,55 +242,3 @@ def compute_meta_targets(
         correct = (predictions == labels)
     
     return correct.astype(int)
-
-
-if __name__ == "__main__":
-    np.random.seed(42)
-    
-    print("Testing Meta-Labeler")
-    print("=" * 50)
-    
-    # Generate synthetic data
-    n_samples = 1000
-    n_sig_features = 10
-    
-    # Simulated base predictions
-    base_preds = np.random.choice([-1, 0, 1], size=n_samples, p=[0.3, 0.2, 0.5])
-    
-    # Market conditions
-    hurst = np.random.uniform(0.3, 0.7, n_samples)
-    volatility = np.random.uniform(0.01, 0.05, n_samples)
-    sig_features = np.random.randn(n_samples, n_sig_features)
-    
-    # True labels with some noise
-    # Predictions are more likely correct when H is high
-    prob_correct = 0.3 + 0.4 * (hurst - 0.3) / 0.4
-    labels = (np.random.random(n_samples) < prob_correct).astype(int)
-    
-    # Create features
-    X = create_meta_features(base_preds.reshape(-1, 1), hurst, volatility, sig_features)
-    
-    print(f"Feature matrix shape: {X.shape}")
-    print(f"Positive class ratio: {labels.mean():.2%}")
-    
-    # Train/test split
-    split = int(0.8 * n_samples)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = labels[:split], labels[split:]
-    
-    # Fit meta-labeler
-    meta = MetaLabeler(n_estimators=50, max_depth=3)
-    meta.fit(X_train, y_train)
-    
-    # Evaluate
-    proba = meta.predict_proba(X_test)
-    preds = meta.predict(X_test, threshold=0.5)
-    
-    accuracy = (preds == y_test).mean()
-    print(f"\nAccuracy: {accuracy:.2%}")
-    
-    # Feature importance
-    print("\nTop 5 Feature Importances:")
-    importance = meta.get_feature_importance()
-    for i, (idx, imp) in enumerate(importance.head().items()):
-        print(f"  Feature {idx}: {imp:.4f}")

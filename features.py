@@ -1,18 +1,98 @@
 """
 Feature engineering module for GME trading strategy.
-Implements multi-dimensional Lead-Lag transformation and path signature computation.
+Implements multi-dimensional Lead-Lag transformation, path signature computation,
+and RobustScaler + PCA preprocessing.
 
 Updated for:
 - 4D paths: (Price_fracdiff, CVD, OI, FundingRate)
 - Classification targets via Triple Barrier labeling
 - Fractional differentiation for memory-preserving stationarity
+- Robust Scaling and PCA
 """
 
 import numpy as np
 import pandas as pd
 import iisignature
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Any
+from sklearn.preprocessing import RobustScaler
+from sklearn.decomposition import PCA
 import config
+
+
+class SignaturePreprocessor:
+    """
+    Preprocessor for signature features involving Robust Scaling and PCA.
+    
+    Ensures that scaling and dimensionality reduction are fitted 
+    strictly on training data to prevent lookahead bias.
+    """
+    
+    def __init__(self, variance_threshold: float = 0.95):
+        """
+        Initialize preprocessor.
+        
+        Args:
+            variance_threshold: PCA explained variance ratio threshold.
+        """
+        self.variance_threshold = variance_threshold
+        self.scaler = RobustScaler()
+        self.pca = PCA(n_components=variance_threshold)
+        self.is_fitted = False
+        
+    def fit(self, X: np.ndarray, y: Optional[np.ndarray] = None) -> 'SignaturePreprocessor':
+        """
+        Fit scaler and PCA on training data.
+        
+        Args:
+            X: Input features (n_samples, n_features)
+            y: Optional target (unused)
+            
+        Returns:
+            self
+        """
+        # Fit scaler
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # Fit PCA
+        # Check if n_samples < n_features, PCA might complain if we want high variance
+        # but have few samples.
+        n_samples, n_features = X.shape
+        if n_samples > n_features:
+             self.pca.fit(X_scaled)
+        else:
+            # Fallback for very small datasets (like unit tests)
+            # Use min(n_samples, n_features) components or simple reduction
+            n_components = min(n_samples, n_features)
+            if n_components > 1:
+                self.pca = PCA(n_components=n_components - 1)
+            else:
+                self.pca = PCA(n_components=1)
+            self.pca.fit(X_scaled)
+            
+        self.is_fitted = True
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        Apply scaling and PCA transformation.
+        
+        Args:
+            X: Input features
+            
+        Returns:
+            Transformed features
+        """
+        if not self.is_fitted:
+            raise ValueError("Preprocessor must be fitted before transform")
+            
+        X_scaled = self.scaler.transform(X)
+        X_pca = self.pca.transform(X_scaled)
+        return X_pca
+        
+    def fit_transform(self, X: np.ndarray, y: Optional[np.ndarray] = None) -> np.ndarray:
+        """Fit and transform in one step."""
+        self.fit(X, y)
+        return self.transform(X)
 
 
 def lead_lag_transform(path: np.ndarray) -> np.ndarray:
@@ -106,6 +186,7 @@ def generate_signature_features(
         
     Returns:
         2D array of shape (n_samples, signature_dim)
+        Note: These are RAW features. Scaling and PCA should be applied downstream.
     """
     n = len(price_fracdiff)
     if n <= window_size:
@@ -263,7 +344,7 @@ if __name__ == "__main__":
     # Test feature engineering
     np.random.seed(42)
     
-    print("Testing Multi-Dimensional Feature Engineering")
+    print("Testing Multi-Dimensional Feature Engineering & Preprocessing")
     print("=" * 60)
     
     # Simulate 4D data
@@ -287,14 +368,6 @@ if __name__ == "__main__":
     print(f"Window size: {config.WINDOW_SIZE}")
     print(f"Signature degree: {config.SIGNATURE_DEGREE}")
     
-    # Test lead-lag transform
-    print("\nTesting Lead-Lag transformation...")
-    sample_path = np.column_stack([price_fracdiff[:10], cvd_norm[:10]])
-    ll_path = lead_lag_transform(sample_path)
-    print(f"  Input path shape: {sample_path.shape}")
-    print(f"  Lead-Lag path shape: {ll_path.shape}")
-    print(f"  Expected: ({2 * len(sample_path) - 1}, {2 * sample_path.shape[1]})")
-    
     # Test signature generation
     print("\nTesting signature computation (4D path)...")
     features = generate_signature_features(
@@ -307,22 +380,31 @@ if __name__ == "__main__":
     )
     
     print(f"  Features shape: {features.shape}")
-    print(f"  Expected samples: {n_points - config.WINDOW_SIZE}")
     
-    # Calculate expected dimension
-    path_dim = 4 * 2  # 4D input * 2 for lead-lag
-    expected_dim = sum(path_dim**k for k in range(1, config.SIGNATURE_DEGREE + 1))
-    print(f"  Expected dimension: {expected_dim}")
+    # Test Preprocessing (Scaler + PCA)
+    print("\nTesting SignaturePreprocessor...")
+    preprocessor = SignaturePreprocessor(variance_threshold=0.95)
     
-    # Feature names
-    print("\nSample feature names:")
-    names = get_signature_feature_names(num_dims=4)
-    for i, name in enumerate(names[:10]):
-        print(f"  {i}: {name}")
-    print(f"  ... ({len(names)} total)")
+    # Split train/test
+    split = int(len(features) * 0.7)
+    X_train = features[:split]
+    X_test = features[split:]
+    
+    # Fit
+    print(f"  Fitting on {len(X_train)} samples...")
+    preprocessor.fit(X_train)
+    
+    # Transform
+    X_train_pca = preprocessor.transform(X_train)
+    X_test_pca = preprocessor.transform(X_test)
+    
+    print(f"  Original Dim: {X_train.shape[1]}")
+    print(f"  Reduced Dim: {X_train_pca.shape[1]}")
+    print(f"  PCA Components: {preprocessor.pca.n_components_}")
     
     # Verify no NaN/Inf
     print(f"\nData quality:")
-    print(f"  NaN features: {np.isnan(features).sum()}")
-    print(f"  Inf features: {np.isinf(features).sum()}")
-    print(f"  Feature variance: {np.var(features, axis=0).mean():.6f}")
+    print(f"  NaN features: {np.isnan(X_test_pca).sum()}")
+    print(f"  Inf features: {np.isinf(X_test_pca).sum()}")
+    
+    print("Done.")

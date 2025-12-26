@@ -1,10 +1,10 @@
 """
-Regime detection using the Hurst Exponent.
+Regime detection using Detrended Fluctuation Analysis (DFA).
 
-The Hurst Exponent H classifies market regimes:
-- H > 0.55: Trending (persistent) - Best for momentum strategies
-- H ≈ 0.50: Random walk - No edge, stay flat
-- H < 0.45: Mean-reverting - Opposite of momentum
+DFA is used to identify the long-memory properties of the time series.
+- alpha > 1.0: Trending (Persistent)
+- alpha < 1.0: Mean-reverting (Anti-persistent) or Noise
+- alpha approx 1.5: Random Walk (if input is price)
 
 By only trading in trending regimes, we filter out periods
 where the signature-based model has no structural edge.
@@ -12,203 +12,184 @@ where the signature-based model has no structural edge.
 
 import numpy as np
 import pandas as pd
-from typing import Tuple
+from typing import Tuple, Optional, List
 
 
-def compute_hurst_rs(series: np.ndarray) -> float:
+def detrended_fluctuation_analysis(series: np.ndarray, scales: Optional[List[int]] = None) -> float:
     """
-    Compute Hurst exponent using the Rescaled Range (R/S) method.
+    Compute the scaling exponent alpha using Detrended Fluctuation Analysis (DFA).
     
-    The R/S method:
-    1. Divide series into chunks of varying sizes
-    2. For each chunk size, compute mean R/S
-    3. Regress log(R/S) vs log(size) to get H
+    DFA measures the long-range correlations in a time series.
     
     Args:
-        series: 1D numpy array of returns or prices
+        series: 1D numpy array (Time series data, e.g. Prices)
+        scales: List of window sizes (scales) to compute fluctuation over.
         
     Returns:
-        Hurst exponent H ∈ (0, 1)
+        Scaling exponent alpha.
     """
+    series = np.array(series)
     n = len(series)
-    if n < 20:
-        return 0.5  # Default to random walk for insufficient data
     
-    # Convert to returns if not already
-    if np.std(series) > 1:  # Likely prices, not returns
-        series = np.diff(np.log(series))
-        n = len(series)
-    
-    max_chunk = n // 4
-    min_chunk = 10
-    
-    if max_chunk < min_chunk:
-        return 0.5
-    
-    # Chunk sizes to analyze
-    chunk_sizes = []
-    rs_values = []
-    
-    size = min_chunk
-    while size <= max_chunk:
-        n_chunks = n // size
-        if n_chunks < 1:
-            break
-            
-        chunk_rs = []
-        for i in range(n_chunks):
-            chunk = series[i * size:(i + 1) * size]
-            
-            # Mean-adjusted cumulative deviation
-            mean = np.mean(chunk)
-            deviations = np.cumsum(chunk - mean)
-            
-            # Range
-            R = np.max(deviations) - np.min(deviations)
-            
-            # Standard deviation
-            S = np.std(chunk, ddof=1)
-            
-            if S > 0:
-                chunk_rs.append(R / S)
+    if n < 50:
+        return 0.5 # Default to uncorrelated if insufficient data
         
-        if chunk_rs:
-            chunk_sizes.append(size)
-            rs_values.append(np.mean(chunk_rs))
+    # 1. Integrate the series (Profile)
+    # We remove the mean and integrate to get the profile Y(k)
+    y = np.cumsum(series - np.mean(series))
+    
+    if scales is None:
+        # Generate logarithmic scales
+        min_scale = 10
+        max_scale = n // 4
+        if max_scale < min_scale:
+             return 0.5
+        # 20 scales log-spaced
+        scales = np.unique(np.logspace(np.log10(min_scale), np.log10(max_scale), num=20).astype(int))
+        scales = scales[scales > 5] # Ensure minimal window size
         
-        size = int(size * 1.5)  # Exponential growth of chunk sizes
-    
-    if len(chunk_sizes) < 3:
+    if len(scales) < 2:
         return 0.5
+
+    fluctuations = []
     
-    # Linear regression of log(R/S) vs log(size)
-    log_sizes = np.log(chunk_sizes)
-    log_rs = np.log(rs_values)
+    for scale in scales:
+        n_segments = n // scale
+        if n_segments < 1:
+            continue
+            
+        rmses = []
+        for i in range(n_segments):
+            # Segment
+            seg = y[i*scale : (i+1)*scale]
+            x = np.arange(scale)
+            
+            # Detrend (Polynomial fit degree 1)
+            coef = np.polyfit(x, seg, 1)
+            trend = np.polyval(coef, x)
+            
+            # RMS fluctuation
+            rms = np.sqrt(np.mean((seg - trend)**2))
+            rmses.append(rms)
+            
+        # F(n) is sqrt(mean(RMS^2)) over segments
+        f_n = np.sqrt(np.mean(np.array(rmses)**2))
+        fluctuations.append(f_n)
+        
+    if len(fluctuations) < 3:
+        return 0.5
+        
+    # Linear regression log(F(n)) vs log(n)
+    # Filter out zeros if any
+    scales_arr = np.array(scales[:len(fluctuations)])
+    flucs_arr = np.array(fluctuations)
     
-    # Least squares fit
-    slope, _ = np.polyfit(log_sizes, log_rs, 1)
+    valid = (flucs_arr > 0)
+    if not np.any(valid):
+        return 0.5
+        
+    log_scales = np.log(scales_arr[valid])
+    log_flucs = np.log(flucs_arr[valid])
     
-    # Clamp to valid range
-    return np.clip(slope, 0.0, 1.0)
+    alpha, _ = np.polyfit(log_scales, log_flucs, 1)
+    return float(alpha)
 
 
-def rolling_hurst(
+def rolling_dfa(
     series: pd.Series,
-    window: int = 30,
-    min_periods: int = 20
+    window: int = 100,
+    min_periods: int = 50
 ) -> pd.Series:
     """
-    Compute rolling Hurst exponent.
+    Compute rolling DFA alpha.
     
     Args:
-        series: Price or return series
-        window: Rolling window size (default 30 days)
-        min_periods: Minimum periods needed to compute
+        series: Price series
+        window: Rolling window size
+        min_periods: Minimum periods
         
     Returns:
-        Series of rolling Hurst exponents
+        Series of rolling alpha values
     """
-    hurst_values = []
+    dfa_values = []
     
     for i in range(len(series)):
         if i < min_periods - 1:
-            hurst_values.append(np.nan)
+            dfa_values.append(np.nan)
         else:
             start = max(0, i - window + 1)
             window_data = series.iloc[start:i + 1].values
-            h = compute_hurst_rs(window_data)
-            hurst_values.append(h)
+            try:
+                alpha = detrended_fluctuation_analysis(window_data)
+                dfa_values.append(alpha)
+            except Exception:
+                dfa_values.append(np.nan)
     
-    return pd.Series(hurst_values, index=series.index)
+    return pd.Series(dfa_values, index=series.index)
 
 
 def get_regime(
-    hurst_value: float,
-    trending_threshold: float = 0.55,
-    mean_revert_threshold: float = 0.45
+    alpha: float,
+    trending_threshold: float = 1.0,
+    mean_revert_threshold: float = 1.0
 ) -> str:
     """
-    Classify market regime based on Hurst exponent.
-    
-    Args:
-        hurst_value: Current Hurst exponent
-        trending_threshold: H above this = trending
-        mean_revert_threshold: H below this = mean-reverting
-        
-    Returns:
-        'trending', 'mean_reverting', or 'random_walk'
+    Classify market regime based on DFA alpha.
     """
-    if np.isnan(hurst_value):
+    if np.isnan(alpha):
         return 'unknown'
-    elif hurst_value > trending_threshold:
+    elif alpha > trending_threshold:
         return 'trending'
-    elif hurst_value < mean_revert_threshold:
+    elif alpha < mean_revert_threshold:
         return 'mean_reverting'
     else:
         return 'random_walk'
 
 
 def regime_filter(
-    hurst_series: pd.Series,
-    trending_threshold: float = 0.55
+    alpha_series: pd.Series,
+    trending_threshold: float = 1.0
 ) -> pd.Series:
     """
-    Create binary filter for tradeable regimes.
-    
-    Returns True only when market is in trending regime.
-    
-    Args:
-        hurst_series: Series of Hurst exponents
-        trending_threshold: H above this to allow trading
-        
-    Returns:
-        Boolean series (True = trade allowed)
+    Create binary filter for tradeable regimes (Trending).
     """
-    return hurst_series > trending_threshold
+    return alpha_series > trending_threshold
 
 
 if __name__ == "__main__":
     np.random.seed(42)
     
-    print("Testing Hurst Exponent Calculation")
+    print("Testing DFA Calculation")
     print("=" * 50)
     
-    # Test 1: Random walk (H ≈ 0.5)
-    n = 500
+    # Test 1: Random walk (alpha approx 1.5 for Price, 0.5 for Returns)
+    # DFA on Price -> Integrated RW -> alpha = 1.5
+    n = 1000
     random_walk = np.cumsum(np.random.randn(n))
-    h_rw = compute_hurst_rs(random_walk)
-    print(f"\nRandom Walk H: {h_rw:.4f} (expected ≈ 0.5)")
+    alpha_rw = detrended_fluctuation_analysis(random_walk)
+    print(f"\nRandom Walk (Price) Alpha: {alpha_rw:.4f} (expected approx 1.5)")
     
-    # Test 2: Trending series (H > 0.5)
-    # Create momentum by accumulating biased increments
-    trend = np.zeros(n)
-    for i in range(1, n):
-        # Each step is biased in the direction of previous step
-        bias = 0.3 * np.sign(trend[i-1] - trend[max(0, i-2)])
-        trend[i] = trend[i-1] + bias + np.random.randn() * 0.5
-    h_trend = compute_hurst_rs(trend)
-    print(f"Trending Series H: {h_trend:.4f} (expected > 0.5)")
+    # Test 2: White Noise (Price input = just noise) -> alpha = 0.5
+    noise = np.random.randn(n)
+    alpha_noise = detrended_fluctuation_analysis(noise)
+    print(f"White Noise Alpha: {alpha_noise:.4f} (expected approx 0.5)")
     
-    # Test 3: Mean-reverting series (H < 0.5)
-    mean_revert = np.zeros(n)
-    for i in range(1, n):
-        mean_revert[i] = -0.3 * mean_revert[i-1] + np.random.randn()
-    mean_revert = np.cumsum(mean_revert)
-    h_mr = compute_hurst_rs(mean_revert)
-    print(f"Mean-Reverting H: {h_mr:.4f} (expected < 0.5)")
-    
-    # Test rolling Hurst
-    print("\nTesting Rolling Hurst...")
+    # Test 3: Trending (Super-diffusive)
+    # Construct a fractional Brownian motion proxy or just a trend
+    t = np.linspace(0, 10, n)
+    trend = t**2 + np.cumsum(np.random.randn(n)) # Strong quadratic trend
+    alpha_trend = detrended_fluctuation_analysis(trend)
+    print(f"Trending Alpha: {alpha_trend:.4f} (expected > 1.5)")
+
+    # Test Rolling
+    print("\nTesting Rolling DFA...")
     series = pd.Series(random_walk)
-    rolling_h = rolling_hurst(series, window=30)
+    rolling_a = rolling_dfa(series, window=100)
     
-    print(f"Rolling Hurst stats:")
-    print(f"  Mean: {rolling_h.mean():.4f}")
-    print(f"  Std: {rolling_h.std():.4f}")
-    print(f"  Min: {rolling_h.min():.4f}")
-    print(f"  Max: {rolling_h.max():.4f}")
+    print(f"Rolling Alpha stats:")
+    print(f"  Mean: {rolling_a.mean():.4f}")
+    print(f"  Std: {rolling_a.std():.4f}")
     
-    # Test regime filter
-    filter_mask = regime_filter(rolling_h, trending_threshold=0.55)
-    pct_tradeable = filter_mask.sum() / len(filter_mask) * 100
-    print(f"\nTradeable periods (H > 0.55): {pct_tradeable:.1f}%")
+    # Filter
+    mask = regime_filter(rolling_a, trending_threshold=1.0)
+    print(f"Tradeable (Alpha > 1.0): {mask.mean()*100:.1f}%")

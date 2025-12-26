@@ -7,10 +7,9 @@ Pipeline:
 2. Apply fractional differentiation for memory-preserving stationarity
 3. Generate triple barrier labels (Long/Short/Flat)
 4. Compute multi-dimensional path signatures
-5. Walk-forward validation with classifier ensemble
-6. Train meta-labeler (XGBoost) on correctness
-7. Apply Hurst regime filter
-8. Backtest with filtering
+5. Nested Walk-forward validation (Base Ensemble + Meta-Learner)
+6. Regime Filter (DFA)
+7. Backtest with filtering
 """
 
 import numpy as np
@@ -22,13 +21,13 @@ warnings.filterwarnings('ignore')
 
 import config
 from data_loader import load_btc_data, prepare_dataset
-from features import generate_signature_features, generate_classification_features
+from features import generate_signature_features
 from models import BaseEnsemble
-from validation import PurgedWalkForwardCV, walk_forward_validation
+from validation import PurgedWalkForwardCV, nested_walk_forward_validation
 from backtest import Backtester
 from fractional_diff import find_optimal_d
 from labeling import compute_daily_volatility, triple_barrier_labels
-from regime import rolling_hurst
+from regime import rolling_dfa, regime_filter
 
 # Optional imports
 try:
@@ -36,12 +35,6 @@ try:
     BINANCE_AVAILABLE = True
 except ImportError:
     BINANCE_AVAILABLE = False
-
-try:
-    from meta_labeler import MetaLabeler, create_meta_features, compute_meta_targets
-    META_LABELER_AVAILABLE = True
-except ImportError:
-    META_LABELER_AVAILABLE = False
 
 
 def run_pipeline(
@@ -51,30 +44,11 @@ def run_pipeline(
     save_results: bool = True
 ) -> dict:
     """
-    Run the complete GME classification pipeline.
-    
-    Steps:
-    1. Load and prepare data (with volume, OI, funding if available)
-    2. Apply fractional differentiation
-    3. Generate triple barrier labels
-    4. Compute multi-dimensional path signatures
-    5. Walk-forward validation
-    6. Train meta-labeler
-    7. Backtest with Hurst filter
-    8. Report metrics
-    
-    Args:
-        data_path: Optional path to CSV data file
-        use_binance: Whether to try Binance/CCXT for data
-        verbose: Whether to print progress
-        save_results: Whether to save results to CSV
-        
-    Returns:
-        Dictionary with all results
+    Run the complete GME classification pipeline with Nested CV.
     """
     if verbose:
         print("=" * 60)
-        print("GEOMETRIC MANIFOLD ENSEMBLE (GME) - CLASSIFICATION")
+        print("GEOMETRIC MANIFOLD ENSEMBLE (GME) - CLASSIFICATION FRAMEWORK")
         print("=" * 60)
         print(f"\nStarted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
@@ -116,7 +90,6 @@ def run_pipeline(
         print(f"Data source: {data_source}")
         print(f"Loaded {len(df)} records")
         print(f"Date range: {df.index[0]} to {df.index[-1]}")
-        print(f"Columns: {list(df.columns)}")
     
     # ========================================
     # Step 2: Fractional Differentiation
@@ -139,8 +112,6 @@ def run_pipeline(
     
     if verbose:
         print(f"Optimal d: {optimal_d:.4f}")
-        print(f"Original series length: {len(prices)}")
-        print(f"After fracdiff length: {len(price_fracdiff)}")
     
     # Align other columns with fracdiff output
     align_start = len(prices) - len(price_fracdiff)
@@ -156,6 +127,7 @@ def run_pipeline(
         df_aligned['cvd_normalized'] = (cvd - cvd.mean()) / cvd.std()
     
     if 'open_interest' in df_aligned.columns:
+        # Re-normalize just in case
         df_aligned['oi_normalized'] = (df_aligned['open_interest'] - df_aligned['open_interest'].mean()) / df_aligned['open_interest'].std()
     
     # ========================================
@@ -191,23 +163,23 @@ def run_pipeline(
         print(f"  Flat (0):  {(valid_labels == 0).sum()} ({(valid_labels == 0).mean()*100:.1f}%)")
     
     # ========================================
-    # Step 4: Compute Hurst Exponent
+    # Step 4: Compute DFA Scaling Exponent (Alpha)
     # ========================================
     if verbose:
         print("\n" + "-" * 40)
-        print("STEP 4: Hurst Exponent Calculation")
+        print("STEP 4: Regime Detection (acc. DFA)")
         print("-" * 40)
     
-    hurst = rolling_hurst(df_aligned[price_col], window=config.HURST_WINDOW)
-    df_aligned['hurst'] = hurst
+    # Using Rolling DFA on Prices
+    alpha_series = rolling_dfa(df_aligned[price_col], window=config.HURST_WINDOW)
+    df_aligned['hurst'] = alpha_series # Storing in 'hurst' col for compatibility
     
     if verbose:
-        valid_hurst = hurst.dropna()
-        trending_pct = (valid_hurst > config.HURST_TRENDING_THRESHOLD).mean() * 100
-        print(f"Hurst Exponent stats:")
-        print(f"  Mean: {valid_hurst.mean():.4f}")
-        print(f"  Std:  {valid_hurst.std():.4f}")
-        print(f"  {trending_pct:.1f}% periods are trending (H > {config.HURST_TRENDING_THRESHOLD})")
+        valid_alpha = alpha_series.dropna()
+        trending_pct = (valid_alpha > 1.0).mean() * 100
+        print(f"DFA Alpha stats:")
+        print(f"  Mean: {valid_alpha.mean():.4f}")
+        print(f"  {trending_pct:.1f}% periods are trending (Alpha > 1.0)")
     
     # ========================================
     # Step 5: Generate Signature Features
@@ -217,7 +189,7 @@ def run_pipeline(
         print("STEP 5: Generating Signature Features")
         print("-" * 40)
     
-    # Prepare dimensions
+    # Prepare dimensions - Handle Hybrid Mode holes
     dims_available = ['price_fracdiff']
     if 'cvd_normalized' in df_aligned.columns:
         dims_available.append('cvd_normalized')
@@ -229,7 +201,7 @@ def run_pipeline(
     if verbose:
         print(f"Path dimensions: {len(dims_available)} ({', '.join(dims_available)})")
     
-    # Generate features
+    # Generate raw features (Preprocessing happens inside Nested CV)
     features = generate_signature_features(
         price_fracdiff=df_aligned['price_fracdiff'].values,
         cvd=df_aligned.get('cvd_normalized', pd.Series([None])).values if 'cvd_normalized' in df_aligned.columns else None,
@@ -239,13 +211,12 @@ def run_pipeline(
         degree=config.SIGNATURE_DEGREE
     )
     
-    # Align targets, hurst, volatility with features
-    # Features[i] uses data [i:i+window], target is at i+window
+    # Align targets, alpha, volatility with features
     target_start = config.WINDOW_SIZE
     target_end = target_start + len(features)
     
     targets = df_aligned['label'].values[target_start:target_end]
-    hurst_aligned = df_aligned['hurst'].values[target_start:target_end]
+    alpha_aligned = df_aligned['hurst'].values[target_start:target_end]
     vol_aligned = df_aligned['volatility'].values[target_start:target_end]
     timestamps = df_aligned.index[target_start:target_end]
     
@@ -257,13 +228,13 @@ def run_pipeline(
     
     if verbose:
         print(f"Generated {len(features)} samples")
-        print(f"Feature dimension: {features.shape[1]}")
+        print(f"Raw Feature dimension: {features.shape[1]}")
     
-    # Handle NaN in targets
-    valid_mask = ~np.isnan(targets) & ~np.isnan(hurst_aligned)
+    # Handle NaN in targets/SideInfo
+    valid_mask = ~np.isnan(targets) & ~np.isnan(alpha_aligned) & ~np.isnan(vol_aligned)
     features = features[valid_mask]
     targets = targets[valid_mask].astype(int)
-    hurst_aligned = hurst_aligned[valid_mask]
+    alpha_aligned = alpha_aligned[valid_mask]
     vol_aligned = vol_aligned[valid_mask]
     actual_returns = actual_returns[valid_mask]
     timestamps = timestamps[valid_mask]
@@ -272,15 +243,22 @@ def run_pipeline(
         print(f"After removing NaN: {len(features)} samples")
     
     # ========================================
-    # Step 6: Walk-Forward Validation
+    # Step 6: Nested Walk-Forward Validation
     # ========================================
     if verbose:
         print("\n" + "-" * 40)
-        print("STEP 6: Walk-Forward Validation")
+        print("STEP 6: Nested Purged Walk-Forward Validation")
+        print("Performing robust double-loop validation with OOS Meta-Labeling")
         print("-" * 40)
     
-    # Initialize classifier ensemble
-    base_ensemble = BaseEnsemble()
+    # Initialize classifier ensemble instance factory
+    model_factory = lambda: BaseEnsemble()
+    
+    # Side info for Meta-Labeler
+    side_info = {
+        'hurst': alpha_aligned,
+        'volatility': vol_aligned
+    }
     
     # Cross-validator
     cv = PurgedWalkForwardCV(
@@ -289,67 +267,27 @@ def run_pipeline(
         expanding=True
     )
     
-    # Run validation
-    val_results = walk_forward_validation(
-        features, targets,
-        base_ensemble, cv=cv, verbose=verbose
+    # Run nested validation
+    val_results = nested_walk_forward_validation(
+        X=features,
+        y=targets,
+        side_info=side_info,
+        model_factory=model_factory,
+        cv=cv,
+        meta_labeler_params=config.META_LABELER_PARAMS,
+        verbose=verbose
     )
     
     # ========================================
-    # Step 7: Meta-Labeler Training
-    # ========================================
-    meta_proba = None
-    if META_LABELER_AVAILABLE:
-        if verbose:
-            print("\n" + "-" * 40)
-            print("STEP 7: Meta-Labeler Training")
-            print("-" * 40)
-        
-        # Get test predictions and targets
-        test_indices = val_results['test_indices']
-        predictions = val_results['predictions']
-        test_targets = val_results['targets']
-        
-        # Compute meta-labels (was prediction correct?)
-        meta_targets = compute_meta_targets(predictions, test_targets)
-        
-        # Create meta-features
-        meta_features = create_meta_features(
-            base_predictions=predictions.reshape(-1, 1),
-            hurst=hurst_aligned[test_indices],
-            volatility=vol_aligned[test_indices],
-            signature_features=features[test_indices][:, :10]  # Use subset of sig features
-        )
-        
-        # Train/test split for meta-labeler (use last fold as test)
-        meta_split = int(0.8 * len(meta_features))
-        
-        meta_learner = MetaLabeler(
-            n_estimators=config.META_LABELER_PARAMS['n_estimators'],
-            max_depth=config.META_LABELER_PARAMS['max_depth'],
-            learning_rate=config.META_LABELER_PARAMS['learning_rate']
-        )
-        
-        meta_learner.fit(meta_features[:meta_split], meta_targets[:meta_split])
-        meta_proba = meta_learner.predict_proba(meta_features)
-        
-        if verbose:
-            meta_acc = (meta_learner.predict(meta_features[meta_split:]) == meta_targets[meta_split:]).mean()
-            print(f"Meta-labeler test accuracy: {meta_acc:.2%}")
-    else:
-        if verbose:
-            print("\nSkipping meta-labeler (xgboost not available)")
-    
-    # ========================================
-    # Step 8: Backtesting
+    # Step 7: Backtesting
     # ========================================
     if verbose:
         print("\n" + "-" * 40)
-        print("STEP 8: Backtesting with Hurst Filter")
+        print("STEP 7: Backtesting with Regime Filter")
         print("-" * 40)
     
     backtester = Backtester(
-        hurst_threshold=config.HURST_TRENDING_THRESHOLD,
+        hurst_threshold=1.0, # DFA Alpha threshold > 1.0 (approximating trend)
         meta_threshold=0.5
     )
     
@@ -359,15 +297,15 @@ def run_pipeline(
     backtest_results, metrics = backtester.run_backtest(
         predictions=val_results['predictions'],
         actual_returns=actual_returns[test_indices],
-        hurst=hurst_aligned[test_indices],
-        meta_proba=meta_proba,
+        hurst=alpha_aligned[test_indices],
+        meta_proba=val_results['meta_probabilities'],
         timestamps=timestamps[test_indices]
     )
     
     backtester.print_metrics(metrics)
     
     # ========================================
-    # Step 9: Save Results
+    # Step 8: Save Results
     # ========================================
     if save_results:
         results_path = 'backtest_results.csv'
@@ -384,14 +322,13 @@ def run_pipeline(
         'targets': targets,
         'validation': val_results,
         'backtest': backtest_results,
-        'metrics': metrics,
-        'optimal_d': optimal_d
+        'metrics': metrics
     }
 
 
 def run_quick_test():
     """
-    Run a quick test with synthetic data to verify pipeline.
+    Run a quick test with synthetic data to verify pipeline logic.
     """
     print("=" * 60)
     print("GME QUICK TEST (Synthetic Data)")
@@ -400,7 +337,7 @@ def run_quick_test():
     np.random.seed(config.RANDOM_SEED)
     
     # Generate synthetic data
-    n_samples = 500
+    n_samples = 1000
     
     # Fractionally differentiated price (stationary)
     price_fracdiff = np.random.randn(n_samples) * 0.01
@@ -410,7 +347,6 @@ def run_quick_test():
     cvd_norm = (cvd - cvd.mean()) / cvd.std()
     
     print(f"\nGenerated {n_samples} synthetic samples")
-    print(f"Using 2D path (price + CVD)")
     
     # Generate features
     print("\nGenerating signature features...")
@@ -426,41 +362,32 @@ def run_quick_test():
     n_features = len(features)
     labels = np.random.choice([-1, 0, 1], size=n_features, p=[0.3, 0.2, 0.5])
     
-    # Synthetic Hurst values
-    hurst = np.random.uniform(0.35, 0.65, n_features)
-    
-    # Initialize classifier ensemble
-    base_ensemble = BaseEnsemble()
+    # Synthetic DFA values
+    hurst = np.random.uniform(0.8, 1.2, n_features) # Around 1.0
+    vol = np.random.uniform(0.01, 0.05, n_features)
     
     # Run validation
-    print("\nRunning walk-forward validation...")
-    cv = PurgedWalkForwardCV(n_splits=3, purge_window=20)
-    val_results = walk_forward_validation(
-        features, labels,
-        base_ensemble, cv=cv, verbose=True
+    print("\nRunning Nested Walk-Forward Validation...")
+    cv = PurgedWalkForwardCV(n_splits=3, purge_window=10, min_train_size=50) # Small for test
+    
+    side_info = {'hurst': hurst, 'volatility': vol}
+    
+    # Use factory
+    model_factory = lambda: BaseEnsemble()
+    
+    val_results = nested_walk_forward_validation(
+        features, labels, side_info,
+        model_factory, cv=cv, meta_labeler_params={'n_estimators': 10, 'max_depth': 2},
+        verbose=True
     )
     
-    # Run backtest
-    print("\nRunning backtest...")
-    backtester = Backtester(hurst_threshold=0.55)
-    
-    actual_returns = np.random.randn(len(val_results['predictions'])) * 0.02
-    
-    backtest_results, metrics = backtester.run_backtest(
-        predictions=val_results['predictions'],
-        actual_returns=actual_returns,
-        hurst=hurst[val_results['test_indices']]
-    )
-    
-    backtester.print_metrics(metrics)
-    
-    print("\n✅ Quick test completed successfully!")
+    print("\n[OK] Quick test completed successfully!")
     return True
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Geometric Manifold Ensemble BTC/USD Classification Strategy"
+        description="Geometric Manifold Ensemble BTC/USD Classification Framework"
     )
     parser.add_argument(
         '--test', 
