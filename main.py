@@ -21,7 +21,7 @@ warnings.filterwarnings('ignore')
 
 import config
 from data_loader import load_btc_data, prepare_dataset
-from features import generate_signature_features
+from features import generate_signature_features, generate_multiscale_signature_features
 from models import BaseEnsemble
 from validation import PurgedWalkForwardCV, nested_walk_forward_validation
 from backtest import Backtester
@@ -71,7 +71,8 @@ def run_pipeline(
                 timeframe=config.TIMEFRAME,
                 lookback_days=config.LOOKBACK_DAYS,
                 include_oi=True,
-                include_funding=True
+                include_funding=True,
+                include_liquidations=True  # 5th dimension
             )
             data_source = "Binance"
         except Exception as e:
@@ -132,48 +133,17 @@ def run_pipeline(
         df_aligned['oi_normalized'] = (df_aligned['open_interest'] - df_aligned['open_interest'].mean()) / df_aligned['open_interest'].std()
     
     # ========================================
-    # Step 3: Triple Barrier Labeling
+    # Step 3: Compute DFA Scaling Exponent (Alpha)
+    # NOTE: Computed BEFORE labeling to enable structural persistence
     # ========================================
     if verbose:
         print("\n" + "-" * 40)
-        print("STEP 3: Triple Barrier Labeling")
-        print("-" * 40)
-    
-    # Compute volatility for dynamic barriers
-    volatility = compute_daily_volatility(
-        df_aligned[price_col],
-        window=config.VOLATILITY_WINDOW
-    )
-    df_aligned['volatility'] = volatility
-    
-    # Generate labels
-    labels, holding_periods = triple_barrier_labels(
-        df_aligned[price_col],
-        volatility,
-        upper_mult=config.BARRIER_UPPER_MULT,
-        lower_mult=config.BARRIER_LOWER_MULT,
-        max_holding_period=config.BARRIER_TIME_DAYS
-    )
-    df_aligned['label'] = labels
-    
-    if verbose:
-        valid_labels = labels.dropna()
-        print(f"Label distribution:")
-        print(f"  Long (1):  {(valid_labels == 1).sum()} ({(valid_labels == 1).mean()*100:.1f}%)")
-        print(f"  Short (-1): {(valid_labels == -1).sum()} ({(valid_labels == -1).mean()*100:.1f}%)")
-        print(f"  Flat (0):  {(valid_labels == 0).sum()} ({(valid_labels == 0).mean()*100:.1f}%)")
-    
-    # ========================================
-    # Step 4: Compute DFA Scaling Exponent (Alpha)
-    # ========================================
-    if verbose:
-        print("\n" + "-" * 40)
-        print("STEP 4: Regime Detection (acc. DFA)")
+        print("STEP 3: Regime Detection (DFA Alpha)")
         print("-" * 40)
     
     # Using Rolling DFA on Prices
     alpha_series = rolling_dfa(df_aligned[price_col], window=config.HURST_WINDOW)
-    df_aligned['hurst'] = alpha_series # Storing in 'hurst' col for compatibility
+    df_aligned['hurst'] = alpha_series  # Storing in 'hurst' col for compatibility
     
     if verbose:
         valid_alpha = alpha_series.dropna()
@@ -183,11 +153,50 @@ def run_pipeline(
         print(f"  {trending_pct:.1f}% periods are trending (Alpha > 1.0)")
     
     # ========================================
-    # Step 5: Generate Signature Features
+    # Step 4: Triple Barrier Labeling (with Structural Persistence)
     # ========================================
     if verbose:
         print("\n" + "-" * 40)
-        print("STEP 5: Generating Signature Features")
+        print("STEP 4: Triple Barrier Labeling (Structural Persistence)")
+        print("-" * 40)
+    
+    # Compute volatility for dynamic barriers
+    volatility = compute_daily_volatility(
+        df_aligned[price_col],
+        window=config.VOLATILITY_WINDOW
+    )
+    df_aligned['volatility'] = volatility
+    
+    # Generate labels with structural persistence
+    # If Alpha > PERSISTENCE_ALPHA_THRESHOLD at time timeout, extend holding period
+    labels, holding_periods = triple_barrier_labels(
+        df_aligned[price_col],
+        volatility,
+        upper_mult=config.BARRIER_UPPER_MULT,
+        lower_mult=config.BARRIER_LOWER_MULT,
+        max_holding_period=config.BARRIER_TIME_DAYS,
+        alpha_series=alpha_series,  # Enable structural persistence
+        persistence_threshold=config.PERSISTENCE_ALPHA_THRESHOLD,
+        max_extension=config.PERSISTENCE_EXTENSION_CANDLES
+    )
+    df_aligned['label'] = labels
+    df_aligned['holding_period'] = holding_periods
+    
+    if verbose:
+        valid_labels = labels.dropna()
+        print(f"Label distribution (with persistence extension):")
+        print(f"  Long (1):  {(valid_labels == 1).sum()} ({(valid_labels == 1).mean()*100:.1f}%)")
+        print(f"  Short (-1): {(valid_labels == -1).sum()} ({(valid_labels == -1).mean()*100:.1f}%)")
+        print(f"  Flat (0):  {(valid_labels == 0).sum()} ({(valid_labels == 0).mean()*100:.1f}%)")
+        avg_hold = holding_periods.dropna().mean()
+        print(f"  Avg holding period: {avg_hold:.1f} candles")
+    
+    # ========================================
+    # Step 5: Generate Multi-Scale Signature Features
+    # ========================================
+    if verbose:
+        print("\n" + "-" * 40)
+        print("STEP 5: Generating Multi-Scale Signature Features")
         print("-" * 40)
     
     # Prepare dimensions - Handle Hybrid Mode holes
@@ -198,22 +207,36 @@ def run_pipeline(
         dims_available.append('oi_normalized')
     if 'funding_rate' in df_aligned.columns:
         dims_available.append('funding_rate')
+    if 'liquidations_normalized' in df_aligned.columns:
+        dims_available.append('liquidations_normalized')
     
     if verbose:
         print(f"Path dimensions: {len(dims_available)} ({', '.join(dims_available)})")
+        print(f"Multi-scale windows: {config.MULTI_SCALE_WINDOWS}")
     
-    # Generate raw features (Preprocessing happens inside Nested CV)
-    features = generate_signature_features(
+    # Use max window for alignment
+    max_window = max(config.MULTI_SCALE_WINDOWS)
+    
+    # Generate multi-scale 'Fractal Signature' features
+    features = generate_multiscale_signature_features(
         price_fracdiff=df_aligned['price_fracdiff'].values,
         cvd=df_aligned.get('cvd_normalized', pd.Series([None])).values if 'cvd_normalized' in df_aligned.columns else None,
         oi=df_aligned.get('oi_normalized', pd.Series([None])).values if 'oi_normalized' in df_aligned.columns else None,
         funding_rate=df_aligned.get('funding_rate', pd.Series([None])).values if 'funding_rate' in df_aligned.columns else None,
-        window_size=config.WINDOW_SIZE,
+        liquidations=df_aligned.get('liquidations_normalized', pd.Series([None])).values if 'liquidations_normalized' in df_aligned.columns else None,
+        window_sizes=config.MULTI_SCALE_WINDOWS,
         degree=config.SIGNATURE_DEGREE
     )
     
-    # Align targets, alpha, volatility with features
-    target_start = config.WINDOW_SIZE
+    if verbose:
+        print(f"Generated {len(features)} samples")
+        print(f"Multi-scale signature dimension: {features.shape[1]} (before PCA)")
+    
+    # ========================================
+    # Step 5b: Append Regime Features (Alpha/Volatility)
+    # ========================================
+    # Align targets, alpha, volatility with features (using max_window)
+    target_start = max_window
     target_end = target_start + len(features)
     
     targets = df_aligned['label'].values[target_start:target_end]
@@ -227,10 +250,6 @@ def run_pipeline(
     else:
         actual_returns = np.log(df_aligned[price_col] / df_aligned[price_col].shift(1)).values[target_start:target_end]
     
-    if verbose:
-        print(f"Generated {len(features)} samples")
-        print(f"Raw Feature dimension: {features.shape[1]}")
-    
     # Handle NaN in targets/SideInfo
     valid_mask = ~np.isnan(targets) & ~np.isnan(alpha_aligned) & ~np.isnan(vol_aligned)
     features = features[valid_mask]
@@ -240,8 +259,14 @@ def run_pipeline(
     actual_returns = actual_returns[valid_mask]
     timestamps = timestamps[valid_mask]
     
+    # Append regime features to signature features
+    # This gives the ensemble context about current market regime
+    regime_features = np.column_stack([alpha_aligned, vol_aligned])
+    features_with_regime = np.hstack([features, regime_features])
+    
     if verbose:
         print(f"After removing NaN: {len(features)} samples")
+        print(f"Appended regime features (alpha, volatility): {features_with_regime.shape[1]} total features")
     
     # ========================================
     # Step 6: Nested Walk-Forward Validation
@@ -249,13 +274,13 @@ def run_pipeline(
     if verbose:
         print("\n" + "-" * 40)
         print("STEP 6: Nested Purged Walk-Forward Validation")
-        print("Performing robust double-loop validation with OOS Meta-Labeling")
+        print("Using regime-augmented features (signatures + alpha + volatility)")
         print("-" * 40)
     
     # Initialize classifier ensemble instance factory
     model_factory = lambda: BaseEnsemble()
     
-    # Side info for Meta-Labeler
+    # Side info for Meta-Labeler (used for meta-features, not ensemble input)
     side_info = {
         'hurst': alpha_aligned,
         'volatility': vol_aligned
@@ -268,9 +293,9 @@ def run_pipeline(
         expanding=True
     )
     
-    # Run nested validation
+    # Run nested validation with regime-augmented features
     val_results = nested_walk_forward_validation(
-        X=features,
+        X=features_with_regime,  # Features now include regime context
         y=targets,
         side_info=side_info,
         model_factory=model_factory,
@@ -332,12 +357,12 @@ def run_quick_test():
     Run a quick test with synthetic data to verify pipeline logic.
     """
     print("=" * 60)
-    print("GME QUICK TEST (Synthetic Data)")
+    print("GME QUICK TEST (Synthetic Data - Multi-Scale)")
     print("=" * 60)
     
     np.random.seed(config.RANDOM_SEED)
     
-    # Generate synthetic data
+    # Generate synthetic 5D data
     n_samples = 1000
     
     # Fractionally differentiated price (stationary)
@@ -347,29 +372,52 @@ def run_quick_test():
     cvd = np.cumsum(np.random.randn(n_samples) * 100)
     cvd_norm = (cvd - cvd.mean()) / cvd.std()
     
-    print(f"\nGenerated {n_samples} synthetic samples")
+    # Synthetic OI
+    oi = np.cumsum(np.random.randn(n_samples) * 50) + 1000
+    oi_norm = (oi - oi.mean()) / oi.std()
     
-    # Generate features
-    print("\nGenerating signature features...")
-    features = generate_signature_features(
+    # Synthetic Funding Rate
+    funding = np.random.randn(n_samples) * 0.0001
+    
+    # Synthetic Liquidations (5th dimension)
+    liqs = np.random.randn(n_samples) * 1000
+    liqs_norm = (liqs - liqs.mean()) / liqs.std()
+    
+    print(f"\nGenerated {n_samples} synthetic samples (5D)")
+    print(f"Multi-scale windows: {config.MULTI_SCALE_WINDOWS}")
+    
+    # Generate multi-scale signature features
+    print("\nGenerating multi-scale signature features...")
+    features = generate_multiscale_signature_features(
         price_fracdiff=price_fracdiff,
         cvd=cvd_norm,
-        window_size=config.WINDOW_SIZE,
+        oi=oi_norm,
+        funding_rate=funding,
+        liquidations=liqs_norm,
+        window_sizes=config.MULTI_SCALE_WINDOWS,
         degree=config.SIGNATURE_DEGREE
     )
-    print(f"Features shape: {features.shape}")
+    print(f"Multi-scale signature shape: {features.shape}")
+    
+    # Alignment offset
+    max_window = max(config.MULTI_SCALE_WINDOWS)
     
     # Generate synthetic labels
-    n_features = len(features)
-    labels = np.random.choice([-1, 0, 1], size=n_features, p=[0.3, 0.2, 0.5])
+    n_feat_samples = len(features)
+    labels = np.random.choice([-1, 0, 1], size=n_feat_samples, p=[0.3, 0.2, 0.5])
     
-    # Synthetic DFA values
-    hurst = np.random.uniform(0.8, 1.2, n_features) # Around 1.0
-    vol = np.random.uniform(0.01, 0.05, n_features)
+    # Synthetic DFA values and volatility
+    hurst = np.random.uniform(0.8, 1.2, n_feat_samples)  # Around 1.0
+    vol = np.random.uniform(0.01, 0.05, n_feat_samples)
+    
+    # Append regime features (as in main pipeline)
+    regime_features = np.column_stack([hurst, vol])
+    features_with_regime = np.hstack([features, regime_features])
+    print(f"Features with regime: {features_with_regime.shape}")
     
     # Run validation
     print("\nRunning Nested Walk-Forward Validation...")
-    cv = PurgedWalkForwardCV(n_splits=3, purge_window=10, min_train_size=50) # Small for test
+    cv = PurgedWalkForwardCV(n_splits=3, purge_window=max_window, min_train_size=100)
     
     side_info = {'hurst': hurst, 'volatility': vol}
     
@@ -377,7 +425,7 @@ def run_quick_test():
     model_factory = lambda: BaseEnsemble()
     
     val_results = nested_walk_forward_validation(
-        features, labels, side_info,
+        features_with_regime, labels, side_info,
         model_factory, cv=cv, meta_labeler_params={'n_estimators': 10, 'max_depth': 2},
         verbose=True
     )

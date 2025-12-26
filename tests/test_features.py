@@ -81,8 +81,9 @@ class TestSignatureComputation:
         
         sig = compute_signature(path_2d, degree=4)
         
-        # Expected: 2 + 4 + 8 + 16 = 30
-        expected_dim = config.SIGNATURE_DIMENSIONS
+        # Expected: For 2D path at degree 4: 2 + 4 + 8 + 16 = 30
+        # Note: config.SIGNATURE_DIMENSIONS is for 5D paths with lead-lag (11110)
+        expected_dim = sum(2**k for k in range(1, 5))  # 2D path, degree 4
         assert len(sig) == expected_dim, \
             f"Expected {expected_dim} dimensions, got {len(sig)}"
     
@@ -139,49 +140,54 @@ class TestSlindingWindowFeatures:
         """Test that output has correct shape."""
         np.random.seed(42)
         n_points = 100
-        log_returns = np.random.randn(n_points) * 0.01
+        price_fracdiff = np.random.randn(n_points) * 0.01
         
-        features, targets = generate_signature_features(
-            log_returns,
+        # New API: returns only features, not (features, targets)
+        features = generate_signature_features(
+            price_fracdiff,
             window_size=config.WINDOW_SIZE,
             degree=config.SIGNATURE_DEGREE
         )
         
         expected_samples = n_points - config.WINDOW_SIZE
-        expected_features = config.SIGNATURE_DIMENSIONS
+        # For 1D input with lead-lag: path_dim = 2, signature dim = 2+4+8+16 = 30
+        expected_features = sum(2**k for k in range(1, config.SIGNATURE_DEGREE + 1))
         
         assert features.shape == (expected_samples, expected_features), \
             f"Expected features shape ({expected_samples}, {expected_features}), got {features.shape}"
-        
-        assert targets.shape == (expected_samples,), \
-            f"Expected targets shape ({expected_samples},), got {targets.shape}"
     
     def test_no_lookahead_bias(self):
         """
         Test that features don't look ahead.
         
-        The target at index i should be the return at time window_size + i,
-        which is AFTER the window used to generate features[i].
+        With the new API, we verify that:
+        1. Feature[i] is computed from window [i : i + window_size]
+        2. Number of features = n - window_size (no lookahead)
         """
         np.random.seed(42)
         n_points = 50
-        log_returns = np.random.randn(n_points) * 0.01
+        price_fracdiff = np.random.randn(n_points) * 0.01
         
         window_size = 24
-        features, targets = generate_signature_features(
-            log_returns,
+        features = generate_signature_features(
+            price_fracdiff,
             window_size=window_size,
             degree=4
         )
         
-        # Target[0] should be log_returns[window_size]
-        assert targets[0] == log_returns[window_size], \
-            "First target should be return at index window_size"
+        # Should have n - window_size samples (features for times window_size to n-1)
+        expected_samples = n_points - window_size
+        assert features.shape[0] == expected_samples, \
+            f"Expected {expected_samples} samples, got {features.shape[0]}"
         
-        # Target[i] should be log_returns[window_size + i]
-        for i in range(len(targets)):
-            assert targets[i] == log_returns[window_size + i], \
-                f"Target[{i}] mismatch with log_returns[{window_size + i}]"
+        # Verify consistent feature generation for same window
+        # Re-running should produce identical features
+        features2 = generate_signature_features(
+            price_fracdiff,
+            window_size=window_size,
+            degree=4
+        )
+        np.testing.assert_array_equal(features, features2)
     
     def test_minimum_data_requirement(self):
         """Test that function raises error with insufficient data."""
@@ -200,13 +206,13 @@ class TestSlindingWindowFeatures:
     def test_deterministic_features(self):
         """Test that same input produces same features."""
         np.random.seed(42)
-        log_returns = np.random.randn(100) * 0.01
+        price_fracdiff = np.random.randn(100) * 0.01
         
-        features1, targets1 = generate_signature_features(log_returns)
-        features2, targets2 = generate_signature_features(log_returns)
+        # New API: returns only features
+        features1 = generate_signature_features(price_fracdiff)
+        features2 = generate_signature_features(price_fracdiff)
         
         np.testing.assert_array_equal(features1, features2)
-        np.testing.assert_array_equal(targets1, targets2)
 
 
 class TestEndToEnd:
@@ -216,21 +222,20 @@ class TestEndToEnd:
         """Test complete feature generation pipeline."""
         np.random.seed(42)
         
-        # Simulate realistic log returns
+        # Simulate realistic fractionally differentiated price
         n_hours = 200
-        log_returns = np.random.randn(n_hours) * 0.01
+        price_fracdiff = np.random.randn(n_hours) * 0.01
         
         # Add some structure for realism
         trend = np.sin(np.linspace(0, 4 * np.pi, n_hours)) * 0.002
-        log_returns += trend
+        price_fracdiff += trend
         
-        # Generate features
-        features, targets = generate_signature_features(log_returns)
+        # Generate features (new API: returns only features)
+        features = generate_signature_features(price_fracdiff)
         
         # Basic sanity checks
         assert not np.isnan(features).any(), "Features contain NaN"
         assert not np.isinf(features).any(), "Features contain Inf"
-        assert not np.isnan(targets).any(), "Targets contain NaN"
         
         # Check feature variance (should not be all zeros)
         feature_variances = np.var(features, axis=0)

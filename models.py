@@ -48,9 +48,9 @@ class BaseEnsemble:
         self.classes_ = np.array([-1, 0, 1])  # Short, Flat, Long
         
         # Logistic Regression - linear baseline
+        # Note: multi_class parameter removed in sklearn 1.2+ (auto-inferred)
         self.logistic = LogisticRegression(
             C=logistic_C,
-            multi_class='multinomial',
             solver='lbfgs',
             max_iter=500,
             random_state=random_state

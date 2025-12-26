@@ -29,33 +29,52 @@ FRACDIFF_THRESHOLD = 1e-4      # FFD weight threshold
 # ==================================
 # Window size in CANDLES
 # For hourly: 24 candles = 1 day of lookback
-# For daily: 20 candles = ~1 month of lookback
+# For daily: 14 candles = ~2 weeks of lookback
 WINDOW_SIZE = 14 if TIMEFRAME == "1d" else 24
+
+# Multi-Scale Signature Windows (Fractal Feature Set)
+# Captures market geometry at multiple timescales
+MULTI_SCALE_WINDOWS = [6, 14, 28]  # Short, Medium, Long windows
 
 SIGNATURE_DEGREE = 4  # Truncation level for path signature
 
-# Path dimensions (updated for multi-dimensional paths)
-# 2D: (Price, Time) - Original approach
-# 3D: (Price, CVD, Time)
-# 4D: (Price, CVD, OI, FundingRate) - Full approach
-PATH_DIMENSIONS = 4
+# Path dimensions (updated for 5D paths with liquidations)
+# 1D: Price only
+# 4D: (Price, CVD, OI, FundingRate) - Standard approach
+# 5D: (Price, CVD, OI, FundingRate, NetLiquidations) - Full microstructure
+PATH_DIMENSIONS = 5
 
-# Signature dimensions for different path dimensions at degree 4:
-# 2D: 2 + 4 + 8 + 16 = 30
-# 3D: 3 + 9 + 27 + 81 = 120
-# 4D: 4 + 16 + 64 + 256 = 340
-def calculate_sig_dim(d: int, degree: int) -> int:
-    """Calculate signature dimension for d-dimensional path at given degree."""
+# Signature dimensions calculation
+# For D-dimensional path with lead-lag doubling (2D dimensions) at degree 4:
+# 4D: 8 + 64 + 512 + 4096 = 4680
+# 5D: 10 + 100 + 1000 + 10000 = 11110
+def calculate_sig_dim(d: int, degree: int, use_lead_lag: bool = True) -> int:
+    """Calculate signature dimension for d-dimensional path at given degree.
+    
+    Args:
+        d: Number of input dimensions
+        degree: Signature truncation degree
+        use_lead_lag: Whether lead-lag transform is applied (doubles dimensions)
+    
+    Returns:
+        Total signature dimension
+    """
+    if use_lead_lag:
+        d = d * 2  # Lead-lag doubles path dimension
     return sum(d**k for k in range(1, degree + 1))
 
+# Single-scale signature dimension (for reference)
 SIGNATURE_DIMENSIONS = calculate_sig_dim(PATH_DIMENSIONS, SIGNATURE_DEGREE)
 
+# Multi-scale total dimension (before PCA)
+MULTI_SCALE_SIG_DIMENSIONS = SIGNATURE_DIMENSIONS * len(MULTI_SCALE_WINDOWS)
+
 # ==================================
-# Triple Barrier Labeling
+# Triple Barrier Labeling (Tuned Parameters)
 # ==================================
-BARRIER_UPPER_MULT = 3.0   # Upper barrier: 3x volatility (optimized)
+BARRIER_UPPER_MULT = 1.5   # Upper barrier: 1.5x volatility (optimized from tuning)
 BARRIER_LOWER_MULT = 1.0   # Lower barrier: 1x volatility (stop loss)
-BARRIER_TIME_DAYS = 3      # Time barrier: 3 days max holding (optimized)
+BARRIER_TIME_DAYS = 3      # Time barrier: 3 days max holding (optimized from tuning)
 VOLATILITY_WINDOW = 20     # Rolling window for volatility calculation
 
 # ==================================
@@ -108,6 +127,17 @@ PURGE_WINDOW = WINDOW_SIZE  # Must match signature window to avoid leakage
 # Trading parameters (DEPRECATED - now using Hurst filter)
 # ==================================
 CONFIDENCE_THRESHOLD_PERCENTILE = 70  # Kept for backward compatibility
+
+# ==================================
+# Position Sizing (Kelly-Scale)
+# ==================================
+KELLY_FRACTION = 0.5  # Half-Kelly for conservative sizing
+
+# ==================================
+# Structural Persistence (Barrier Extension)
+# ==================================
+PERSISTENCE_ALPHA_THRESHOLD = 1.45   # Extend barriers when Alpha > this
+PERSISTENCE_EXTENSION_CANDLES = 5    # Max additional candles to extend (up to another max_holding_period)
 
 # ==================================
 # Random seed for reproducibility

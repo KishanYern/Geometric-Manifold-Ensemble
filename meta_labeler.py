@@ -120,11 +120,13 @@ class MetaLabeler:
             else:
                 X_fit, y_fit = X, y
             
+            # XGBoost 2.0+ requires early_stopping_rounds as constructor param
+            self.model.set_params(early_stopping_rounds=early_stopping_rounds)
+            
             self.model.fit(
                 X_fit, y_fit,
                 eval_set=eval_set,
-                verbose=False,
-                early_stopping_rounds=early_stopping_rounds
+                verbose=False
             )
         else:
             self.model.fit(X, y)

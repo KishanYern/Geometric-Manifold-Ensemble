@@ -228,6 +228,7 @@ def nested_walk_forward_validation(
                 meta_acc = accuracy_score(is_correct, meta_decisions)
                 print(f"  Meta Accuracy: {meta_acc:.4f}")
 
+
     return {
         'predictions': np.array(all_base_preds),
         'meta_probabilities': np.array(all_meta_probs),
@@ -235,3 +236,190 @@ def nested_walk_forward_validation(
         'test_indices': np.array(all_test_indices),
         'fold_metrics': fold_metrics
     }
+
+
+def deflated_sharpe_ratio(
+    observed_sr: float,
+    sr_benchmark: float = 0.0,
+    n_trials: int = 1,
+    n_observations: int = 252,
+    skewness: float = 0.0,
+    kurtosis: float = 3.0,
+    verbose: bool = True
+) -> dict:
+    """
+    Calculate Deflated Sharpe Ratio (DSR) using Bailey & López de Prado (2014) methodology.
+    
+    DSR adjusts the Sharpe Ratio for the effects of multiple testing by estimating 
+    the probability that the observed SR is not just the maximum of random trials.
+    
+    The key insight: When you try N strategies and pick the best one, the "best" 
+    Sharpe Ratio is biased upward. DSR corrects for this selection bias.
+    
+    Formula:
+    1. Expected maximum SR from N trials: E[max(SR)] = SR_benchmark + σ_SR * E[Z_max]
+       where E[Z_max] ≈ (1 - γ) * Φ^{-1}(1 - 1/N) + γ * Φ^{-1}(1 - 1/(N*e))
+       and γ ≈ 0.5772 (Euler-Mascheroni constant)
+    
+    2. Standard deviation of SR: σ_SR = sqrt((1 + 0.5*SR^2 - skew*SR + (kurt-3)/4*SR^2) / (n-1))
+    
+    3. DSR = Φ((SR_observed - E[max(SR)]) / σ_SR)
+    
+    Args:
+        observed_sr: The observed Sharpe Ratio from backtest
+        sr_benchmark: Benchmark SR (typically 0 for null hypothesis)
+        n_trials: Number of independent strategies/parameter sets tested
+        n_observations: Number of return observations (e.g., 252 for daily over 1 year)
+        skewness: Skewness of returns (0 for normal)
+        kurtosis: Kurtosis of returns (3 for normal)
+        verbose: Print detailed output
+        
+    Returns:
+        Dict with DSR probability and adjusted metrics
+    """
+    from scipy.stats import norm
+    
+    # Euler-Mascheroni constant
+    gamma = 0.5772156649
+    
+    # Standard deviation of SR estimator (Mertens 2002)
+    # Accounts for non-normality of returns
+    sr_std = np.sqrt(
+        (1 + 0.5 * observed_sr**2 - skewness * observed_sr + 
+         (kurtosis - 3) / 4 * observed_sr**2) / (n_observations - 1)
+    )
+    
+    # Expected maximum SR from N trials (Extreme Value Theory)
+    if n_trials > 1:
+        # Approximate E[max(Z)] for N standard normals
+        # Using Gumbel approximation
+        z_max_approx = (
+            (1 - gamma) * norm.ppf(1 - 1 / n_trials) + 
+            gamma * norm.ppf(1 - 1 / (n_trials * np.e))
+        )
+        expected_max_sr = sr_benchmark + sr_std * z_max_approx
+    else:
+        expected_max_sr = sr_benchmark
+    
+    # Deflated probability: P(observed SR is genuine, not from selection bias)
+    # This is the probability that a genuinely skillful strategy would achieve this SR
+    if sr_std > 0:
+        z_score = (observed_sr - expected_max_sr) / sr_std
+        dsr_probability = norm.cdf(z_score)
+    else:
+        dsr_probability = 0.5
+    
+    # "Haircut" SR: what SR would be expected from random selection
+    haircut_sr = observed_sr - expected_max_sr
+    
+    result = {
+        'observed_sr': observed_sr,
+        'expected_max_sr': expected_max_sr,
+        'sr_std': sr_std,
+        'dsr_probability': dsr_probability,
+        'haircut_sr': haircut_sr,
+        'n_trials': n_trials,
+        'n_observations': n_observations
+    }
+    
+    if verbose:
+        print("\n" + "=" * 60)
+        print("DEFLATED SHARPE RATIO (DSR) ANALYSIS")
+        print("Bailey & Lopez de Prado (2014) Multiple Testing Correction")
+        print("=" * 60)
+        print(f"\nInput Parameters:")
+        print(f"  Observed Sharpe Ratio:    {observed_sr:>10.4f}")
+        print(f"  Number of Trials (N):     {n_trials:>10d}")
+        print(f"  Number of Observations:   {n_observations:>10d}")
+        print(f"  SR Benchmark (H0):        {sr_benchmark:>10.4f}")
+        
+        print(f"\nDSR Calculation:")
+        print(f"  SR Standard Deviation:    {sr_std:>10.4f}")
+        print(f"  Expected Max SR (bias):   {expected_max_sr:>10.4f}")
+        print(f"  Haircut SR:               {haircut_sr:>10.4f}")
+        
+        print(f"\nResult:")
+        print(f"  DSR Probability:          {dsr_probability:>10.2%}")
+        
+        if dsr_probability > 0.95:
+            print("  Interpretation: [STRONG] - Highly likely to be genuine skill")
+        elif dsr_probability > 0.80:
+            print("  Interpretation: [MODERATE] - Likely genuine, but some selection bias possible")
+        elif dsr_probability > 0.50:
+            print("  Interpretation: [WEAK] - May be partially due to selection bias")
+        else:
+            print("  Interpretation: [FAIL] - Likely due to selection bias / overfitting")
+        
+        print("=" * 60)
+    
+    return result
+
+
+def calculate_meta_labeler_performance(fold_metrics: list, verbose: bool = True) -> dict:
+    """
+    Analyze Meta-Labeler performance across folds.
+    
+    The Meta-Labeler's job is to predict whether the base model's trade will be correct.
+    Good meta-accuracy (significantly above 50%) indicates it identifies trade quality.
+    
+    Args:
+        fold_metrics: List of fold metric dicts from nested_walk_forward_validation
+        verbose: Print detailed output
+        
+    Returns:
+        Dict with aggregated meta-labeler statistics
+    """
+    folds_with_meta = [f for f in fold_metrics if f.get('meta_available', False)]
+    
+    if not folds_with_meta:
+        return {'error': 'No meta-labeler results available'}
+    
+    base_accuracies = [f['base_accuracy'] for f in fold_metrics]
+    meta_accuracies = [f.get('meta_accuracy', 0.5) for f in folds_with_meta if 'meta_accuracy' in f or hasattr(f, 'meta_accuracy')]
+    
+    result = {
+        'n_folds': len(fold_metrics),
+        'n_folds_with_meta': len(folds_with_meta),
+        'mean_base_accuracy': np.mean(base_accuracies),
+        'std_base_accuracy': np.std(base_accuracies),
+        'mean_meta_accuracy': np.mean(meta_accuracies) if meta_accuracies else 0.5,
+        'std_meta_accuracy': np.std(meta_accuracies) if meta_accuracies else 0.0,
+        'meta_above_random': np.mean(meta_accuracies) > 0.5 if meta_accuracies else False,
+        'fold_details': fold_metrics
+    }
+    
+    if verbose:
+        print("\n" + "=" * 60)
+        print("META-LABELER PERFORMANCE ANALYSIS")
+        print("=" * 60)
+        
+        print(f"\nFold-by-Fold Results:")
+        print("-" * 50)
+        for fold in fold_metrics:
+            meta_str = f"{fold.get('meta_accuracy', 'N/A'):.4f}" if 'meta_accuracy' in fold else "N/A"
+            print(f"  Fold {fold['fold']}: Base Acc = {fold['base_accuracy']:.4f}, "
+                  f"Meta Acc = {meta_str}")
+        
+        print(f"\nAggregated Statistics:")
+        print(f"  Mean Base Accuracy:  {result['mean_base_accuracy']:.4f} (+/- {result['std_base_accuracy']:.4f})")
+        print(f"  Mean Meta Accuracy:  {result['mean_meta_accuracy']:.4f} (+/- {result['std_meta_accuracy']:.4f})")
+        
+        print(f"\nMeta-Labeler Evaluation:")
+        meta_edge = result['mean_meta_accuracy'] - 0.5
+        if meta_edge > 0.15:
+            print(f"  [STRONG] Meta-Labeler has significant edge ({meta_edge:.1%} above random)")
+            print("  -> Can effectively filter out bad trades")
+        elif meta_edge > 0.05:
+            print(f"  [MODERATE] Meta-Labeler has some edge ({meta_edge:.1%} above random)")
+            print("  -> Provides value but with noise")
+        elif meta_edge > 0:
+            print(f"  [WEAK] Meta-Labeler has minimal edge ({meta_edge:.1%} above random)")
+            print("  -> Limited ability to identify trade failures")
+        else:
+            print(f"  [FAIL] Meta-Labeler performs at or below random ({meta_edge:.1%})")
+            print("  -> Not adding value to position sizing")
+        
+        print("=" * 60)
+    
+    return result
+

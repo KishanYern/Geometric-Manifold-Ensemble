@@ -13,7 +13,7 @@ Barriers are dynamic, scaled by rolling volatility σ.
 
 import numpy as np
 import pandas as pd
-from typing import Tuple
+from typing import Tuple, Optional
 import config
 
 
@@ -47,10 +47,17 @@ def get_barrier_timestamps(
     start_idx: int,
     upper_barrier: float,
     lower_barrier: float,
-    max_holding_period: int
+    max_holding_period: int,
+    alpha_series: Optional[pd.Series] = None,
+    persistence_threshold: float = config.PERSISTENCE_ALPHA_THRESHOLD,
+    max_extension: int = config.PERSISTENCE_EXTENSION_CANDLES
 ) -> Tuple[int, int]:
     """
     Find which barrier is hit first and when.
+    
+    Supports structural persistence: if the time barrier would be hit but
+    the DFA Alpha is still above the persistence threshold, extend the
+    holding period up to max_extension additional candles.
     
     Args:
         close: Price series
@@ -58,6 +65,9 @@ def get_barrier_timestamps(
         upper_barrier: Upper price barrier (absolute)
         lower_barrier: Lower price barrier (absolute)
         max_holding_period: Maximum bars to hold
+        alpha_series: Optional DFA Alpha series for persistence check
+        persistence_threshold: Alpha threshold for extension (default 1.45)
+        max_extension: Maximum additional bars to extend (default from config)
         
     Returns:
         Tuple of (barrier_type, bars_held)
@@ -66,6 +76,7 @@ def get_barrier_timestamps(
     entry_price = close.iloc[start_idx]
     end_idx = min(start_idx + max_holding_period, len(close) - 1)
     
+    # Phase 1: Check barriers during normal holding period
     for i in range(start_idx + 1, end_idx + 1):
         price = close.iloc[i]
         
@@ -77,7 +88,37 @@ def get_barrier_timestamps(
         if price <= lower_barrier:
             return -1, i - start_idx
     
-    # Time barrier hit
+    # Phase 2: Structural Persistence Extension
+    # If time barrier would be hit but Alpha is still high, extend holding period
+    if alpha_series is not None and end_idx < len(alpha_series):
+        current_alpha = alpha_series.iloc[end_idx]
+        
+        if not np.isnan(current_alpha) and current_alpha > persistence_threshold:
+            # Extend holding period while Alpha remains high
+            extended_end = min(end_idx + max_extension, len(close) - 1)
+            
+            for i in range(end_idx + 1, extended_end + 1):
+                price = close.iloc[i]
+                
+                # Check if Alpha drops below threshold (persistence break)
+                if i < len(alpha_series):
+                    alpha_at_i = alpha_series.iloc[i]
+                    if np.isnan(alpha_at_i) or alpha_at_i <= persistence_threshold:
+                        # Persistence broken - exit with time barrier
+                        return 0, i - start_idx
+                
+                # Check upper barrier
+                if price >= upper_barrier:
+                    return 1, i - start_idx
+                
+                # Check lower barrier
+                if price <= lower_barrier:
+                    return -1, i - start_idx
+            
+            # Extended period exhausted
+            return 0, extended_end - start_idx
+    
+    # Normal time barrier hit
     return 0, max_holding_period
 
 
@@ -86,7 +127,10 @@ def triple_barrier_labels(
     volatility: pd.Series,
     upper_mult: float = 2.0,
     lower_mult: float = 1.0,
-    max_holding_period: int = 5
+    max_holding_period: int = 5,
+    alpha_series: Optional[pd.Series] = None,
+    persistence_threshold: float = config.PERSISTENCE_ALPHA_THRESHOLD,
+    max_extension: int = config.PERSISTENCE_EXTENSION_CANDLES
 ) -> Tuple[pd.Series, pd.Series]:
     """
     Generate Triple Barrier labels for each time point.
@@ -95,6 +139,10 @@ def triple_barrier_labels(
     - Upper barrier: close[t] + upper_mult * volatility[t]
     - Lower barrier: close[t] - lower_mult * volatility[t]
     - Time barrier: t + max_holding_period
+    
+    Supports structural persistence: if time barrier would be hit but
+    DFA Alpha remains high (> persistence_threshold), the holding period
+    is extended up to max_extension additional candles.
     
     Labels:
     - 1: Upper barrier hit first (Long correct, bullish trend)
@@ -107,6 +155,9 @@ def triple_barrier_labels(
         upper_mult: Upper barrier multiplier (default 2x volatility)
         lower_mult: Lower barrier multiplier (default 1x volatility)
         max_holding_period: Maximum holding period in bars
+        alpha_series: Optional DFA Alpha series for persistence extension
+        persistence_threshold: Alpha threshold for extending holding period
+        max_extension: Maximum additional bars to extend
         
     Returns:
         Tuple of (labels, holding_periods)
@@ -115,7 +166,10 @@ def triple_barrier_labels(
     labels = pd.Series(index=close.index, dtype=float)
     holding_periods = pd.Series(index=close.index, dtype=float)
     
-    for i in range(len(close) - max_holding_period):
+    # Account for potential extensions in loop range
+    total_max_hold = max_holding_period + (max_extension if alpha_series is not None else 0)
+    
+    for i in range(len(close) - total_max_hold):
         idx = close.index[i]
         
         # Skip if volatility not available
@@ -130,9 +184,12 @@ def triple_barrier_labels(
         upper_barrier = entry_price * (1 + upper_mult * vol)
         lower_barrier = entry_price * (1 - lower_mult * vol)
         
-        # Find which barrier is hit first
+        # Find which barrier is hit first (with optional persistence extension)
         barrier_type, bars = get_barrier_timestamps(
-            close, i, upper_barrier, lower_barrier, max_holding_period
+            close, i, upper_barrier, lower_barrier, max_holding_period,
+            alpha_series=alpha_series,
+            persistence_threshold=persistence_threshold,
+            max_extension=max_extension
         )
         
         labels.iloc[i] = barrier_type

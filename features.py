@@ -165,6 +165,7 @@ def generate_signature_features(
     cvd: Optional[np.ndarray] = None,
     oi: Optional[np.ndarray] = None,
     funding_rate: Optional[np.ndarray] = None,
+    liquidations: Optional[np.ndarray] = None,
     window_size: int = config.WINDOW_SIZE,
     degree: int = config.SIGNATURE_DEGREE,
     use_lead_lag: bool = True
@@ -180,6 +181,7 @@ def generate_signature_features(
         cvd: Cumulative Volume Delta (optional, 2nd dimension)
         oi: Open Interest normalized (optional, 3rd dimension)
         funding_rate: Funding rate (optional, 4th dimension)
+        liquidations: Net liquidations normalized (optional, 5th dimension)
         window_size: Size of sliding window
         degree: Signature truncation degree
         use_lead_lag: Whether to apply lead-lag transform
@@ -201,6 +203,8 @@ def generate_signature_features(
         dims.append(np.array(oi))
     if funding_rate is not None:
         dims.append(np.array(funding_rate))
+    if liquidations is not None:
+        dims.append(np.array(liquidations))
     
     # Stack dimensions
     multi_dim_data = np.column_stack(dims)  # (n, num_dims)
@@ -234,6 +238,108 @@ def generate_signature_features(
         sig = compute_signature(path, degree)
         
         features[i] = sig
+    
+    return features
+
+
+def generate_multiscale_signature_features(
+    price_fracdiff: np.ndarray,
+    cvd: Optional[np.ndarray] = None,
+    oi: Optional[np.ndarray] = None,
+    funding_rate: Optional[np.ndarray] = None,
+    liquidations: Optional[np.ndarray] = None,
+    window_sizes: list = None,
+    degree: int = config.SIGNATURE_DEGREE,
+    use_lead_lag: bool = True
+) -> np.ndarray:
+    """
+    Generate multi-scale 'Fractal Signature' features.
+    
+    For each time step t, computes path signatures at multiple window sizes
+    (e.g., short=6, medium=14, long=28 candles) and concatenates them into
+    a single feature vector. This captures market geometry across timescales.
+    
+    CRITICAL: Uses only past data for each window to ensure ZERO lookahead bias.
+    
+    Args:
+        price_fracdiff: Fractionally differentiated price (main signal)
+        cvd: Cumulative Volume Delta (optional, 2nd dimension)
+        oi: Open Interest normalized (optional, 3rd dimension)
+        funding_rate: Funding rate (optional, 4th dimension)
+        liquidations: Net liquidations normalized (optional, 5th dimension)
+        window_sizes: List of window sizes [short, medium, long]
+        degree: Signature truncation degree
+        use_lead_lag: Whether to apply lead-lag transform
+        
+    Returns:
+        2D array of shape (n_samples, total_signature_dim)
+        where total_signature_dim = sum(sig_dim for each window)
+    """
+    if window_sizes is None:
+        window_sizes = config.MULTI_SCALE_WINDOWS
+    
+    # Sort windows to use largest for sample count calculation
+    window_sizes = sorted(window_sizes)
+    max_window = max(window_sizes)
+    
+    n = len(price_fracdiff)
+    if n <= max_window:
+        raise ValueError(f"Not enough data: {n} points, need > {max_window}")
+    
+    # Build multi-dimensional path
+    dims = [np.array(price_fracdiff)]
+    
+    if cvd is not None:
+        dims.append(np.array(cvd))
+    if oi is not None:
+        dims.append(np.array(oi))
+    if funding_rate is not None:
+        dims.append(np.array(funding_rate))
+    if liquidations is not None:
+        dims.append(np.array(liquidations))
+    
+    # Stack dimensions
+    multi_dim_data = np.column_stack(dims)  # (n, num_dims)
+    num_dims = multi_dim_data.shape[1]
+    
+    # Calculate signature dimension per scale
+    if use_lead_lag:
+        path_dim = 2 * num_dims
+    else:
+        path_dim = num_dims
+    sig_dim_per_scale = sum(path_dim**k for k in range(1, degree + 1))
+    total_sig_dim = sig_dim_per_scale * len(window_sizes)
+    
+    # Number of samples (limited by largest window)
+    n_samples = n - max_window
+    
+    # Pre-allocate feature array
+    features = np.zeros((n_samples, total_sig_dim))
+    
+    for i in range(n_samples):
+        # Start position is offset by max_window to ensure all windows have data
+        start_pos = i + max_window
+        
+        scale_features = []
+        
+        for window_size in window_sizes:
+            # Window: [start_pos - window_size, start_pos)
+            window_start = start_pos - window_size
+            window_data = multi_dim_data[window_start:start_pos]
+            
+            # Convert to cumulative path
+            path = np.cumsum(window_data, axis=0)
+            
+            # Apply Lead-Lag transformation
+            if use_lead_lag:
+                path = lead_lag_transform(path)
+            
+            # Compute signature
+            sig = compute_signature(path, degree)
+            scale_features.append(sig)
+        
+        # Concatenate all scale signatures
+        features[i] = np.concatenate(scale_features)
     
     return features
 

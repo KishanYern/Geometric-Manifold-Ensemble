@@ -226,9 +226,9 @@ def run_full_audit(verbose: bool = True) -> dict:
     
     if verbose:
         if feature_audit['passed']:
-            print("   ✅ PASSED - No lookahead bias in feature generation")
+            print("   [PASS] PASSED - No lookahead bias in feature generation")
         else:
-            print(f"   ❌ FAILED - {len(feature_audit['issues'])} issues found")
+            print(f"   [FAIL] FAILED - {len(feature_audit['issues'])} issues found")
             for issue in feature_audit['issues'][:5]:
                 print(f"      {issue}")
     
@@ -246,12 +246,12 @@ def run_full_audit(verbose: bool = True) -> dict:
     
     if verbose:
         if cv_audit['passed']:
-            print("   ✅ PASSED - No leakage in CV splits")
+            print("   [PASS] PASSED - No leakage in CV splits")
             for fold in cv_audit['fold_info']:
                 print(f"      Fold {fold['fold']}: train {fold['train_range']}, "
                       f"test {fold['test_range']}, gap={fold['gap']}")
         else:
-            print(f"   ❌ FAILED - {len(cv_audit['issues'])} issues found")
+            print(f"   [FAIL] FAILED - {len(cv_audit['issues'])} issues found")
             for issue in cv_audit['issues']:
                 print(f"      {issue}")
     
@@ -259,7 +259,7 @@ def run_full_audit(verbose: bool = True) -> dict:
     if verbose:
         print("\n3. Confidence Threshold Audit")
         print("-" * 40)
-        print("   ⚠️  WARNING - Potential lookahead bias detected")
+        print("   [WARN] WARNING - Potential lookahead bias detected")
         print("      The confidence threshold is computed using ALL test variances")
         print("      Recommendation: Use training variances for threshold calculation")
     
@@ -275,10 +275,10 @@ def run_full_audit(verbose: bool = True) -> dict:
     if verbose:
         print("\n" + "=" * 60)
         if overall_passed:
-            print("OVERALL: ✅ Core pipeline has no leakage")
-            print("         ⚠️  Minor fix needed for confidence threshold")
+            print("OVERALL: [PASS] Core pipeline has no leakage")
+            print("         [WARN] Minor fix needed for confidence threshold")
         else:
-            print("OVERALL: ❌ Leakage detected - review issues above")
+            print("OVERALL: [FAIL] Leakage detected - review issues above")
         print("=" * 60)
     
     results['overall_passed'] = overall_passed

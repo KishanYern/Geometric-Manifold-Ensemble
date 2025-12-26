@@ -1,12 +1,13 @@
 """
 Backtesting engine for GME trading strategy.
-Updated for classification-based trading with DFA/Hurst regime filtering.
+Updated for classification-based trading with DFA/Hurst regime filtering
+and Kelly-scale position sizing based on meta-labeler confidence.
 
 Trading Logic:
 1. Base ensemble predicts: Long (1), Short (-1), Flat (0)
-2. Meta-labeler vetos if confidence is low
-3. Regime filter only allows trades in trending regimes (Alpha > 1.0)
-4. Final signal is executed only if all filters pass
+2. Meta-labeler provides P(Correct) for position sizing
+3. Regime filter only allows trades in trending regimes (Alpha > threshold)
+4. Position size = Signal × (2×P(Correct) - 1) × Kelly_Fraction
 """
 
 import numpy as np
@@ -17,11 +18,13 @@ import config
 
 class Backtester:
     """
-    Backtesting engine for classification-based trading strategy.
+    Backtesting engine for classification-based trading strategy
+    with Kelly-scale position sizing.
     
-    Filters:
+    Features:
     1. Regime Filter: Only trade when Alpha > trending_threshold
-    2. Meta-Labeler Filter: Only trade when meta-confidence > threshold
+    2. Kelly Position Sizing: Size positions based on meta-labeler confidence
+       Position = Signal × (2×P(Correct) - 1) × Kelly_Fraction
     3. Direction: Follow base ensemble's Long/Short/Flat signal
     """
     
@@ -49,64 +52,122 @@ class Backtester:
         hurst: np.ndarray,
         meta_proba: Optional[np.ndarray] = None,
         apply_hurst_filter: bool = True,
-        apply_meta_filter: bool = True
+        apply_kelly_sizing: bool = True
     ) -> np.ndarray:
         """
-        Generate trading signals with regime and meta filtering.
+        Generate trading signals with regime filtering and Kelly position sizing.
         
-        Signal values:
-        - 1: Long position
-        - -1: Short position
-        - 0: Flat (no position)
+        Returns fractional position sizes when meta_proba is provided and
+        apply_kelly_sizing is True.
+        
+        Position sizing logic:
+        - Base signal: 1 (Long), -1 (Short), 0 (Flat)
+        - Kelly size: Signal × (2×P(Correct) - 1) × KELLY_FRACTION
         
         Args:
             predictions: Base ensemble predictions (1, -1, 0)
             hurst: Regime indicator values (DFA Alpha)
-            meta_proba: Meta-labeler probabilities (optional)
+            meta_proba: Meta-labeler probabilities P(Correct)
             apply_hurst_filter: Whether to apply regime filter
-            apply_meta_filter: Whether to apply meta-labeler filter
+            apply_kelly_sizing: Whether to apply Kelly position sizing
             
         Returns:
-            Array of trading signals
+            Array of position sizes (fractional if Kelly sizing, else integer signals)
         """
-        signals = predictions.copy().astype(float)
+        positions = predictions.copy().astype(float)
         
-        # Apply Regime filter
+        # Apply Regime filter - zero out positions in non-trending regimes
         if apply_hurst_filter:
-            # Only trade in trending regimes
             non_trending = hurst < self.hurst_threshold
-            signals[non_trending] = 0
+            positions[non_trending] = 0
         
-        # Apply meta-labeler filter
-        if apply_meta_filter and meta_proba is not None:
-            low_confidence = meta_proba < self.meta_threshold
-            signals[low_confidence] = 0
+        # Apply Kelly position sizing based on meta-labeler confidence
+        if apply_kelly_sizing and meta_proba is not None:
+            # Kelly formula: bet_size = edge / odds
+            # Simplified for binary outcome: Position = Signal × (2×P - 1)
+            # Only scale positions that passed the regime filter
+            active_mask = positions != 0
+            
+            if active_mask.any():
+                # Edge: P(Correct) - P(Incorrect) = 2P - 1
+                # Maps [0.5, 1.0] -> [0, 1] (no bet below 50% confidence)
+                edge = np.clip(2 * meta_proba - 1, 0, 1)
+                
+                # Apply Kelly fraction for conservative sizing
+                kelly_size = edge * config.KELLY_FRACTION
+                
+                # Scale active positions by Kelly size
+                positions[active_mask] = positions[active_mask] * kelly_size[active_mask]
         
-        return signals.astype(int)
+        return positions
+    
+    def compute_position_sizes(
+        self,
+        signals: np.ndarray,
+        meta_proba: np.ndarray,
+        method: str = 'kelly'
+    ) -> np.ndarray:
+        """
+        Compute position sizes based on meta-labeler probabilities.
+        
+        This is a standalone method for explicit position sizing.
+        
+        Methods:
+        - 'binary': Traditional 1/0/-1 sizing (no scaling)
+        - 'kelly': Position = Signal × (2×P(Correct) - 1) × KELLY_FRACTION
+        - 'linear': Position = Signal × P(Correct)
+        
+        Args:
+            signals: Base trading signals (1, -1, 0)
+            meta_proba: Meta-labeler probabilities
+            method: Sizing method ('binary', 'kelly', 'linear')
+            
+        Returns:
+            Array of position sizes
+        """
+        if method == 'binary':
+            return signals.astype(float)
+        
+        elif method == 'kelly':
+            # Kelly criterion: bet size = edge
+            # Edge = 2×P - 1, maps [0.5, 1.0] -> [0, 1]
+            edge = np.clip(2 * meta_proba - 1, 0, 1)
+            return signals * edge * config.KELLY_FRACTION
+        
+        elif method == 'linear':
+            # Linear scaling: full size at P=1, half at P=0.5
+            return signals * meta_proba
+        
+        else:
+            raise ValueError(f"Unknown position sizing method: {method}")
     
     def compute_returns(
         self,
-        signals: np.ndarray,
+        positions: np.ndarray,
         actual_returns: np.ndarray,
         include_costs: bool = True
     ) -> pd.DataFrame:
         """
-        Compute strategy returns based on signals.
+        Compute strategy returns based on position sizes.
+        
+        Supports fractional position sizes for Kelly-scaled portfolios.
+        Transaction costs are proportional to the change in position size.
         
         Args:
-            signals: Trading signals (1 for long, -1 for short, 0 for flat)
+            positions: Position sizes (can be fractional, e.g., 0.3, -0.5)
             actual_returns: Actual log returns that were realized
             include_costs: Whether to include transaction costs
             
         Returns:
             DataFrame with strategy returns and metrics
         """
-        # Strategy returns = signal * actual return
-        strategy_returns = signals * actual_returns
+        # Strategy returns = position_size × actual_return
+        strategy_returns = positions * actual_returns
         
-        # Transaction costs on position changes
+        # Transaction costs on position changes (proportional to change size)
         if include_costs:
-            position_changes = np.abs(np.diff(signals, prepend=0))
+            # Change in position (includes fractional changes)
+            position_changes = np.abs(np.diff(positions, prepend=0))
             costs = position_changes * self.transaction_cost
             strategy_returns -= costs
         
@@ -114,7 +175,7 @@ class Backtester:
         buy_hold_returns = actual_returns.copy()
         
         return pd.DataFrame({
-            'signal': signals,
+            'position': positions,
             'actual_return': actual_returns,
             'strategy_return': strategy_returns,
             'buy_hold_return': buy_hold_returns
@@ -207,32 +268,34 @@ class Backtester:
         actual_returns: np.ndarray,
         hurst: np.ndarray,
         meta_proba: Optional[np.ndarray] = None,
-        timestamps: Optional[pd.DatetimeIndex] = None
+        timestamps: Optional[pd.DatetimeIndex] = None,
+        apply_kelly_sizing: bool = True
     ) -> Tuple[pd.DataFrame, Dict[str, float]]:
         """
-        Run complete backtest.
+        Run complete backtest with Kelly position sizing.
         
         Args:
             predictions: Base ensemble predictions (1, -1, 0)
             actual_returns: Actual returns that occurred
             hurst: Hurst/DFA values
-            meta_proba: Optional meta-labeler probabilities
+            meta_proba: Optional meta-labeler probabilities for position sizing
             timestamps: Optional datetime index for results
+            apply_kelly_sizing: Whether to apply Kelly position sizing
             
         Returns:
             Tuple of (results_df, metrics_dict)
         """
-        # Generate filtered signals
-        signals = self.generate_signals(
+        # Generate positions with regime filter and Kelly sizing
+        positions = self.generate_signals(
             predictions=predictions,
             hurst=hurst,
             meta_proba=meta_proba,
             apply_hurst_filter=True,
-            apply_meta_filter=(meta_proba is not None)
+            apply_kelly_sizing=apply_kelly_sizing and (meta_proba is not None)
         )
         
         # Compute returns
-        results = self.compute_returns(signals, actual_returns)
+        results = self.compute_returns(positions, actual_returns)
         
         # Add Hurst and meta info
         results['hurst'] = hurst
@@ -264,9 +327,12 @@ class Backtester:
         strategy_metrics['pct_mean_revert'] = regime_counts.get('mean_revert', 0) / len(results)
         strategy_metrics['pct_random'] = regime_counts.get('random', 0) / len(results)
         
-        # Trade filter statistics
-        strategy_metrics['trades_taken'] = (signals != 0).sum()
-        strategy_metrics['trades_filtered'] = ((predictions != 0) & (signals == 0)).sum()
+        # Position/Trade statistics
+        active_positions = positions[positions != 0]
+        strategy_metrics['trades_taken'] = len(active_positions)
+        strategy_metrics['trades_filtered'] = ((predictions != 0) & (positions == 0)).sum()
+        strategy_metrics['avg_position_size'] = np.abs(active_positions).mean() if len(active_positions) > 0 else 0.0
+        strategy_metrics['max_position_size'] = np.abs(positions).max()
         
         return results, strategy_metrics
     
@@ -294,6 +360,10 @@ class Backtester:
         print(f"  Profit Factor:    {metrics['profit_factor']:>10.2f}")
         print(f"  Trades Taken:     {metrics.get('trades_taken', 0):>10.0f}")
         print(f"  Trades Filtered:  {metrics.get('trades_filtered', 0):>10.0f}")
+        
+        print("\nPosition Sizing (Kelly):")
+        print(f"  Avg Position Size:{metrics.get('avg_position_size', 0):>10.2%}")
+        print(f"  Max Position Size:{metrics.get('max_position_size', 0):>10.2%}")
         
         print("\nRegime Statistics:")
         print(f"  Trending (Alpha>{self.hurst_threshold}): {metrics.get('pct_trending', 0):>10.1%}")
