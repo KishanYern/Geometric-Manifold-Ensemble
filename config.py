@@ -12,7 +12,7 @@ TIMEFRAME = "1d"
 
 # Lookback period (adaptive based on timeframe)
 # Daily: 3 years = ~1,095 candles
-LOOKBACK_DAYS = 365 * 3
+LOOKBACK_DAYS = 365 * 5
 
 # For backward compatibility
 INTERVAL = TIMEFRAME
@@ -22,7 +22,7 @@ INTERVAL = TIMEFRAME
 # ==================================
 FRACDIFF_D_RANGE = (0.3, 0.7)  # Search range for optimal d
 FRACDIFF_ADF_PVALUE = 0.05     # Target p-value for stationarity
-FRACDIFF_THRESHOLD = 1e-5      # FFD weight threshold
+FRACDIFF_THRESHOLD = 1e-4      # FFD weight threshold
 
 # ==================================
 # Feature engineering parameters
@@ -30,7 +30,7 @@ FRACDIFF_THRESHOLD = 1e-5      # FFD weight threshold
 # Window size in CANDLES
 # For hourly: 24 candles = 1 day of lookback
 # For daily: 20 candles = ~1 month of lookback
-WINDOW_SIZE = 24 if TIMEFRAME == "1h" else 20
+WINDOW_SIZE = 14 if TIMEFRAME == "1d" else 24
 
 SIGNATURE_DEGREE = 4  # Truncation level for path signature
 
@@ -53,17 +53,18 @@ SIGNATURE_DIMENSIONS = calculate_sig_dim(PATH_DIMENSIONS, SIGNATURE_DEGREE)
 # ==================================
 # Triple Barrier Labeling
 # ==================================
-BARRIER_UPPER_MULT = 2.0   # Upper barrier: 2x volatility (profit take)
+BARRIER_UPPER_MULT = 3.0   # Upper barrier: 3x volatility (optimized)
 BARRIER_LOWER_MULT = 1.0   # Lower barrier: 1x volatility (stop loss)
-BARRIER_TIME_DAYS = 5      # Time barrier: 5 days max holding
+BARRIER_TIME_DAYS = 3      # Time barrier: 3 days max holding (optimized)
 VOLATILITY_WINDOW = 20     # Rolling window for volatility calculation
 
 # ==================================
 # Regime Detection (Hurst Exponent)
 # ==================================
-HURST_WINDOW = 30                    # Rolling window for Hurst calculation
+HURST_WINDOW = 100                 # Rolling window for Hurst calculation (needs >50 for DFA)
 HURST_TRENDING_THRESHOLD = 0.55      # H above this = trending (trade allowed)
 HURST_MEAN_REVERT_THRESHOLD = 0.45   # H below this = mean-reverting (no trade)
+DFA_ALPHA_THRESHOLD = 1.45    # DFA Alpha threshold (optimized)
 
 # ==================================
 # Model parameters

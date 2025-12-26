@@ -35,6 +35,7 @@ junit/
 
 # Project specific
 backtest_results.csv
+tuning_results.csv
 *.log
 .vscode/
 .idea/

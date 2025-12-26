@@ -87,7 +87,8 @@ def find_optimal_d(
     d_range: Tuple[float, float] = (0.0, 1.0),
     target_pvalue: float = 0.05,
     tolerance: float = 0.01,
-    max_iterations: int = 20
+    max_iterations: int = 20,
+    threshold: float = 1e-5
 ) -> Tuple[float, pd.Series]:
     """
     Find minimum fractional differentiation order that achieves stationarity.
@@ -101,6 +102,7 @@ def find_optimal_d(
         target_pvalue: Target ADF p-value (default 0.05)
         tolerance: Convergence tolerance for d
         max_iterations: Maximum binary search iterations
+        threshold: Weight cutoff threshold (default 1e-5)
         
     Returns:
         Tuple of (optimal_d, differentiated_series)
@@ -113,7 +115,7 @@ def find_optimal_d(
         d_mid = (d_low + d_high) / 2
         
         try:
-            diff_series = fractional_diff(series, d_mid)
+            diff_series = fractional_diff(series, d_mid, threshold=threshold)
             if len(diff_series) < 20:  # Need enough points for ADF
                 d_low = d_mid
                 continue
@@ -138,7 +140,7 @@ def find_optimal_d(
     
     # If no optimal found, use maximum d
     if optimal_series is None:
-        optimal_series = fractional_diff(series, optimal_d)
+        optimal_series = fractional_diff(series, optimal_d, threshold=threshold)
     
     return optimal_d, optimal_series
 

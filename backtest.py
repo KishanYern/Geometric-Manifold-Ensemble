@@ -27,7 +27,7 @@ class Backtester:
     
     def __init__(
         self,
-        hurst_threshold: float = 1.0, # Now represents DFA Alpha threshold
+        hurst_threshold: float = config.DFA_ALPHA_THRESHOLD, # Now represents DFA Alpha threshold
         meta_threshold: float = 0.5,
         transaction_cost: float = 0.0005  # 5 bps per trade
     ):
@@ -276,25 +276,25 @@ class Backtester:
         print("BACKTEST RESULTS")
         print("=" * 50)
         
-        print("\n📈 Returns:")
+        print("\nReturns:")
         print(f"  Total Return:     {metrics['total_return']:>10.2%}")
         print(f"  Annual Return:    {metrics['annual_return']:>10.2%}")
         print(f"  Buy & Hold:       {metrics.get('buy_hold_return', 0):>10.2%}")
         print(f"  Alpha:            {metrics.get('alpha', 0):>10.2%}")
         
-        print("\n📊 Risk Metrics:")
+        print("\nRisk Metrics:")
         print(f"  Annual Volatility:{metrics['annual_volatility']:>10.2%}")
         print(f"  Max Drawdown:     {metrics['max_drawdown']:>10.2%}")
         print(f"  Sharpe Ratio:     {metrics['sharpe_ratio']:>10.2f}")
         print(f"  Sortino Ratio:    {metrics['sortino_ratio']:>10.2f}")
         
-        print("\n🎯 Trade Statistics:")
+        print("\nTrade Statistics:")
         print(f"  Total Trades:     {metrics['total_trades']:>10.0f}")
         print(f"  Win Rate:         {metrics['win_rate']:>10.2%}")
         print(f"  Profit Factor:    {metrics['profit_factor']:>10.2f}")
         print(f"  Trades Taken:     {metrics.get('trades_taken', 0):>10.0f}")
         print(f"  Trades Filtered:  {metrics.get('trades_filtered', 0):>10.0f}")
         
-        print("\n🔄 Regime Statistics:")
+        print("\nRegime Statistics:")
         print(f"  Trending (Alpha>{self.hurst_threshold}): {metrics.get('pct_trending', 0):>10.1%}")
         print(f"  Mean-Reverting:   {metrics.get('pct_mean_revert', 0):>10.1%}")

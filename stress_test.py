@@ -205,7 +205,7 @@ if __name__ == "__main__":
     n = 1000
     preds = np.random.randint(-1, 2, n)
     rets = np.random.randn(n) * 0.01
-    hurst = np.random.rand(n)
+    hurst = np.random.uniform(0.5, 1.7, n) # Range covering noise to trend
     meta = np.random.rand(n)
     
     print("\nRunning Slippage Sweep...")

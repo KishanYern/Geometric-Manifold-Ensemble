@@ -42,22 +42,23 @@ pip install scipy xgboost
 
 ## 📉 Usage
 
-### Running Validation
-Execute the comprehensive validation suite to verify strategy robustness:
+### 1. Hyperparameter Tuning
+Optimize the strategy parameters (regime threshold, barriers, etc.) for the current market:
 ```bash
-python validation.py
+python tuning.py
+```
+This will output `tuning_results.csv` with the best configurations.
+
+### 2. End-to-End Execution
+Run the full pipeline (Data Loading -> Feature Engineering -> Nested CV -> Backtest):
+```bash
+python main.py
 ```
 
-### Stress Testing
+### 3. Stress Testing
 Run synthetic stress tests and sensitivity analysis:
 ```bash
 python stress_test.py
-```
-
-### Backtesting
-Run the historical backtest logic:
-```bash
-python backtest.py
 ```
 
 ## 📚 References

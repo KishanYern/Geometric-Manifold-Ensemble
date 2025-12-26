@@ -107,7 +107,8 @@ def run_pipeline(
     optimal_d, price_fracdiff = find_optimal_d(
         prices,
         d_range=config.FRACDIFF_D_RANGE,
-        target_pvalue=config.FRACDIFF_ADF_PVALUE
+        target_pvalue=config.FRACDIFF_ADF_PVALUE,
+        threshold=config.FRACDIFF_THRESHOLD
     )
     
     if verbose:
@@ -287,7 +288,7 @@ def run_pipeline(
         print("-" * 40)
     
     backtester = Backtester(
-        hurst_threshold=1.0, # DFA Alpha threshold > 1.0 (approximating trend)
+        hurst_threshold=config.DFA_ALPHA_THRESHOLD, # DFA Alpha trending threshold
         meta_threshold=0.5
     )
     
