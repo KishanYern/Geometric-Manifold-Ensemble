@@ -1,0 +1,25 @@
+# Geometric Manifold Ensemble - Dependencies
+# Core data manipulation
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Path signature computation
+iisignature>=0.24
+
+# Machine learning
+scikit-learn>=1.3.0
+lightgbm>=4.0.0
+xgboost>=2.0.0
+
+# Data sources
+yfinance>=0.2.30
+ccxt>=4.0.0
+
+# Statistical tests
+statsmodels>=0.14.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Testing
+pytest>=7.0.0
