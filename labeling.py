@@ -55,16 +55,18 @@ def get_barrier_timestamps(
     """
     Find which barrier is hit first and when.
     
-    Supports structural persistence: if the time barrier would be hit but
-    the DFA Alpha is still above the persistence threshold, extend the
-    holding period up to max_extension additional candles.
+    Enhanced Persistence Logic:
+    1. If DFA Alpha at entry > persistence_threshold, DOUBLE the holding period upfront
+       to let winners run in persistent trending regimes.
+    2. During extended period, continue checking barriers.
+    3. If Alpha drops below threshold during extension, exit early.
     
     Args:
         close: Price series
         start_idx: Starting index for the trade
         upper_barrier: Upper price barrier (absolute)
         lower_barrier: Lower price barrier (absolute)
-        max_holding_period: Maximum bars to hold
+        max_holding_period: Maximum bars to hold (base)
         alpha_series: Optional DFA Alpha series for persistence check
         persistence_threshold: Alpha threshold for extension (default 1.45)
         max_extension: Maximum additional bars to extend (default from config)
@@ -74,9 +76,18 @@ def get_barrier_timestamps(
         barrier_type: 1 (upper), -1 (lower), 0 (time)
     """
     entry_price = close.iloc[start_idx]
-    end_idx = min(start_idx + max_holding_period, len(close) - 1)
     
-    # Phase 1: Check barriers during normal holding period
+    # Determine holding period based on entry-time Alpha (persistence at entry)
+    current_holding = max_holding_period
+    if alpha_series is not None and start_idx < len(alpha_series):
+        entry_alpha = alpha_series.iloc[start_idx]
+        if not np.isnan(entry_alpha) and entry_alpha > persistence_threshold:
+            # Double the holding window for persistent trends at entry
+            current_holding = max_holding_period * 2
+    
+    end_idx = min(start_idx + current_holding, len(close) - 1)
+    
+    # Phase 1: Check barriers during (potentially extended) holding period
     for i in range(start_idx + 1, end_idx + 1):
         price = close.iloc[i]
         
@@ -87,39 +98,47 @@ def get_barrier_timestamps(
         # Check lower barrier (stop loss)
         if price <= lower_barrier:
             return -1, i - start_idx
-    
-    # Phase 2: Structural Persistence Extension
-    # If time barrier would be hit but Alpha is still high, extend holding period
-    if alpha_series is not None and end_idx < len(alpha_series):
-        current_alpha = alpha_series.iloc[end_idx]
         
-        if not np.isnan(current_alpha) and current_alpha > persistence_threshold:
-            # Extend holding period while Alpha remains high
-            extended_end = min(end_idx + max_extension, len(close) - 1)
-            
-            for i in range(end_idx + 1, extended_end + 1):
-                price = close.iloc[i]
-                
-                # Check if Alpha drops below threshold (persistence break)
-                if i < len(alpha_series):
-                    alpha_at_i = alpha_series.iloc[i]
-                    if np.isnan(alpha_at_i) or alpha_at_i <= persistence_threshold:
-                        # Persistence broken - exit with time barrier
-                        return 0, i - start_idx
-                
-                # Check upper barrier
-                if price >= upper_barrier:
-                    return 1, i - start_idx
-                
-                # Check lower barrier
-                if price <= lower_barrier:
-                    return -1, i - start_idx
-            
-            # Extended period exhausted
-            return 0, extended_end - start_idx
+        # If in extended period (beyond base max_holding), check if Alpha drops
+        if i > start_idx + max_holding_period and alpha_series is not None:
+            if i < len(alpha_series):
+                alpha_at_i = alpha_series.iloc[i]
+                if np.isnan(alpha_at_i) or alpha_at_i <= persistence_threshold:
+                    # Persistence broken during extension - exit with time barrier
+                    return 0, i - start_idx
     
-    # Normal time barrier hit
-    return 0, max_holding_period
+    # Phase 2: Additional extension check (if not already extended)
+    # Only applies if we didn't extend upfront and Alpha is still high at end
+    if current_holding == max_holding_period:
+        if alpha_series is not None and end_idx < len(alpha_series):
+            current_alpha = alpha_series.iloc[end_idx]
+            
+            if not np.isnan(current_alpha) and current_alpha > persistence_threshold:
+                # Extend holding period while Alpha remains high
+                extended_end = min(end_idx + max_extension, len(close) - 1)
+                
+                for i in range(end_idx + 1, extended_end + 1):
+                    price = close.iloc[i]
+                    
+                    # Check if Alpha drops below threshold (persistence break)
+                    if i < len(alpha_series):
+                        alpha_at_i = alpha_series.iloc[i]
+                        if np.isnan(alpha_at_i) or alpha_at_i <= persistence_threshold:
+                            return 0, i - start_idx
+                    
+                    # Check upper barrier
+                    if price >= upper_barrier:
+                        return 1, i - start_idx
+                    
+                    # Check lower barrier
+                    if price <= lower_barrier:
+                        return -1, i - start_idx
+                
+                # Extended period exhausted
+                return 0, extended_end - start_idx
+    
+    # Time barrier hit
+    return 0, current_holding
 
 
 def triple_barrier_labels(

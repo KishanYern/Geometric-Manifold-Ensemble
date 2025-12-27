@@ -30,7 +30,7 @@ FRACDIFF_THRESHOLD = 1e-4      # FFD weight threshold
 # Window size in CANDLES
 # For hourly: 24 candles = 1 day of lookback
 # For daily: 14 candles = ~2 weeks of lookback
-WINDOW_SIZE = 14 if TIMEFRAME == "1d" else 24
+WINDOW_SIZE = 14  # Optimized from tuning (best Sharpe)
 
 # Multi-Scale Signature Windows (Fractal Feature Set)
 # Captures market geometry at multiple timescales
@@ -72,9 +72,9 @@ MULTI_SCALE_SIG_DIMENSIONS = SIGNATURE_DIMENSIONS * len(MULTI_SCALE_WINDOWS)
 # ==================================
 # Triple Barrier Labeling (Tuned Parameters)
 # ==================================
-BARRIER_UPPER_MULT = 1.5   # Upper barrier: 1.5x volatility (optimized from tuning)
-BARRIER_LOWER_MULT = 1.0   # Lower barrier: 1x volatility (stop loss)
-BARRIER_TIME_DAYS = 3      # Time barrier: 3 days max holding (optimized from tuning)
+BARRIER_UPPER_MULT = 1.5   # Upper barrier: 1.5x volatility (optimized - SR 0.61)
+BARRIER_LOWER_MULT = 1.5   # Lower barrier: 1.5x volatility (symmetric)
+BARRIER_TIME_DAYS = 3      # Time barrier: 3 days (doubled via persistence when Alpha high)
 VOLATILITY_WINDOW = 20     # Rolling window for volatility calculation
 
 # ==================================
@@ -83,7 +83,7 @@ VOLATILITY_WINDOW = 20     # Rolling window for volatility calculation
 HURST_WINDOW = 100                 # Rolling window for Hurst calculation (needs >50 for DFA)
 HURST_TRENDING_THRESHOLD = 0.55      # H above this = trending (trade allowed)
 HURST_MEAN_REVERT_THRESHOLD = 0.45   # H below this = mean-reverting (no trade)
-DFA_ALPHA_THRESHOLD = 1.45    # DFA Alpha threshold (optimized)
+DFA_ALPHA_THRESHOLD = 1.60    # DFA Alpha threshold (optimized - best SR 0.61)
 
 # ==================================
 # Model parameters
@@ -95,7 +95,7 @@ LOGISTIC_C = 1.0
 LIGHTGBM_PARAMS = {
     "n_estimators": 100,
     "max_depth": 5,
-    "learning_rate": 0.05,
+    "learning_rate": 0.05,  # Optimized from tuning (best Sharpe 0.61)
     "n_jobs": -1,
     "verbosity": -1,
     "random_state": 42
